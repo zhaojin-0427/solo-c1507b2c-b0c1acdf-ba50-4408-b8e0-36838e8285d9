@@ -96,14 +96,15 @@ class SolutionSpec(BaseModel):
 def tempo_offsets_percent(float_percent: float, step_percent: float) -> list[float]:
     """Symmetric tempo offsets (percent) within ±float_percent.
 
-    Always contains the base offset 0 and both endpoints, plus interior grid
-    points spaced step_percent apart. Shared by the search-space validator and
-    the engine so their counts never disagree."""
+    Always contains the base offset 0 and both endpoints; interior samples sit
+    at ±k·step_percent, so the grid mirrors around the base even when the step
+    does not divide the interval. Shared by the search-space validator and the
+    engine so their counts never disagree."""
     offsets = {0.0, -float_percent, float_percent}
-    k = 1
-    while -float_percent + k * step_percent < float_percent - 1e-9:
-        offsets.add(round(-float_percent + k * step_percent, 9))
-        k += 1
+    n = int(float_percent / step_percent)  # floor for positive floats
+    for k in range(1, n + 1):
+        offsets.add(round(k * step_percent, 9))
+        offsets.add(round(-k * step_percent, 9))
     return sorted(offsets)
 
 

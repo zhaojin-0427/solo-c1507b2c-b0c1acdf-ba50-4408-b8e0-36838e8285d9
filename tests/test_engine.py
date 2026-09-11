@@ -302,6 +302,21 @@ def test_tempo_factors_always_include_base_factor():
         assert all(lo <= x <= hi for x in factors)
 
 
+def test_tempo_factors_mirror_symmetric_when_step_does_not_divide():
+    # regression: 5% float with 3% step used to give [0.95, 0.98, 1.0, 1.01,
+    # 1.04, 1.05], biased to one side of the base factor
+    factors = engine._tempo_factors(
+        SearchLimits(tempo_float_percent=5.0, tempo_step_percent=3.0)
+    )
+    assert factors == [0.95, 0.97, 1.0, 1.03, 1.05]
+    for f, s in [(5.0, 3.0), (5.0, 2.0), (3.0, 7.0), (10.0, 4.0)]:
+        grid = engine._tempo_factors(
+            SearchLimits(tempo_float_percent=f, tempo_step_percent=s)
+        )
+        for x in grid:
+            assert round(2.0 - x, 6) in grid  # mirror image around 1.0
+
+
 def test_search_includes_baseline_tempo_with_coarse_step():
     r = req([note("a", 2.0, 60), note("b", 4.0, 62)])
     limits = SearchLimits(

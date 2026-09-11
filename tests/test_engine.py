@@ -257,6 +257,68 @@ def test_search_ranking_prefers_fewer_deletions_then_less_deviation():
     assert deletions == sorted(deletions)
 
 
+def test_search_metrics_only_count_kept_notes():
+    # regression: "late" (beat 100, pitch missing from the comb) is deleted by
+    # the search; the rhythm error must be computed from the kept notes only.
+    # With tempo x1.05 the kept note at beat 4 errs by 4*0.5*(1/1.05-1).
+    r = req([note("a", 4.0, 60), note("late", 100.0, 66)])
+    limits = SearchLimits(
+        max_transpose_semitones=0,
+        tempo_float_percent=5.0,
+        tempo_step_percent=5.0,
+        quantize_grids_beats=[],
+    )
+    candidates, _ = engine.search(r, limits)
+    by_factor = {c.solution.tempo_factor: c for c in candidates}
+    assert set(by_factor) == {0.95, 1.0, 1.05}
+    fast = by_factor[1.05]
+    assert fast.solution.deleted_note_ids == ["late"]
+    assert fast.metrics.deleted_count == 1
+    assert fast.metrics.rhythm_error_seconds == 0.095238
+    assert fast.metrics.rhythm_error_seconds == engine.r6(
+        abs(4.0 * 0.5 * (1.0 / 1.05 - 1.0))
+    )
+
+
+def test_duplicate_deleted_ids_are_canonical():
+    sol = SolutionSpec(deleted_note_ids=["b", "b", "a", "b"])
+    assert sol.deleted_note_ids == ["a", "b"]
+    assert SolutionSpec().deleted_note_ids == []
+
+
+def test_tempo_factors_always_include_base_factor():
+    # float 1% with a coarse 25% step must still enumerate the base factor 1.0
+    assert engine._tempo_factors(
+        SearchLimits(tempo_float_percent=1.0, tempo_step_percent=25.0)
+    ) == [0.99, 1.0, 1.01]
+    # base factor present for any float/step combination
+    for f, s in [(5.0, 1.0), (5.0, 2.0), (3.0, 7.0), (0.0, 1.0)]:
+        factors = engine._tempo_factors(
+            SearchLimits(tempo_float_percent=f, tempo_step_percent=s)
+        )
+        assert 1.0 in factors
+        lo, hi = round(1 - f / 100, 6), round(1 + f / 100, 6)
+        assert lo in factors and hi in factors  # both endpoints kept
+        assert all(lo <= x <= hi for x in factors)
+
+
+def test_search_includes_baseline_tempo_with_coarse_step():
+    r = req([note("a", 2.0, 60), note("b", 4.0, 62)])
+    limits = SearchLimits(
+        max_transpose_semitones=0,
+        tempo_float_percent=1.0,
+        tempo_step_percent=25.0,
+        quantize_grids_beats=[],
+    )
+    candidates, evaluated = engine.search(r, limits)
+    assert evaluated == 3  # 1 transpose x 3 tempo factors x 1 grid option
+    factors = [c.solution.tempo_factor for c in candidates]
+    assert 1.0 in factors
+    best = candidates[0]
+    assert best.solution.tempo_factor == 1.0  # zero rhythm error wins
+    assert best.metrics.rhythm_error_seconds == 0.0
+
+
 def test_determinism_same_input_same_output():
     r = req([note("a", 2.0, 60), note("b", 4.0, 61), note("c", 6.0, 64)])
     sol = SolutionSpec(transpose_semitones=1, tempo_factor=0.98, quantize_grid_beats=0.25)

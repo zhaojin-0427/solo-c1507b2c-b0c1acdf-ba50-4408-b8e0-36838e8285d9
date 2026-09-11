@@ -26,6 +26,7 @@ from .models import (
     PinOut,
     SearchLimits,
     SolutionSpec,
+    tempo_offsets_percent,
 )
 
 EPS = 1e-9
@@ -397,9 +398,12 @@ def missing_notes_out(missing: list[TxNote]) -> list[MissingNote]:
 
 
 def _tempo_factors(limits: SearchLimits) -> list[float]:
-    f, s = limits.tempo_float_percent, limits.tempo_step_percent
-    steps = int(round(2 * f / s))
-    return [round(1.0 + (-f + k * s) / 100.0, 6) for k in range(steps + 1)]
+    return [
+        round(1.0 + o / 100.0, 6)
+        for o in tempo_offsets_percent(
+            limits.tempo_float_percent, limits.tempo_step_percent
+        )
+    ]
 
 
 def _quantize_feasible(kept: list[TxNote], limits: SearchLimits, grid: float | None) -> bool:
@@ -413,29 +417,30 @@ def _quantize_feasible(kept: list[TxNote], limits: SearchLimits, grid: float | N
 
 def _greedy_deletions(
     req: ArrangementRequest, sol: SolutionSpec, limits: SearchLimits
-) -> tuple[SolutionSpec | None, list[TxNote], list[TxNote]]:
+) -> tuple[SolutionSpec | None, list[TxNote], list[TxNote], list[TxNote]]:
     """Delete conflicting unlocked notes (most-conflicting first) until the
     layout is manufacturable. Locked notes are never deleted; if only locked
-    notes remain in conflict the combination is infeasible."""
+    notes remain in conflict the combination is infeasible. Returns the final
+    solution together with (placed, missing, kept) for that solution."""
     locked_by_id = {n.id: n.locked for n in req.notes}
     beat_by_id = {n.id: n.beat for n in req.notes}
     deleted: list[str] = []
     while True:
-        placed, missing, _ = place(req, sol)
+        placed, missing, kept = place(req, sol)
         issues = diagnose(req, placed, missing)
         if not issues:
-            return sol, placed, missing
+            return sol, placed, missing, kept
         counts: Counter[str] = Counter()
         for issue in issues:
             for nid in issue.note_ids:
                 if not locked_by_id[nid]:
                     counts[nid] += 1
         if not counts:  # only locked notes in conflict -> unfixable
-            return None, placed, missing
+            return None, placed, missing, kept
         victim = min(counts, key=lambda nid: (-counts[nid], beat_by_id[nid], nid))
         deleted.append(victim)
         if len(deleted) > limits.max_deletions:
-            return None, placed, missing
+            return None, placed, missing, kept
         sol = sol.model_copy(update={"deleted_note_ids": sorted(deleted)})
 
 
@@ -472,7 +477,9 @@ def search(req: ArrangementRequest, limits: SearchLimits) -> tuple[list[Candidat
                 _, _, kept = place(req, sol)
                 if not _quantize_feasible(kept, limits, g):
                     continue
-                final, placed, _ = _greedy_deletions(req, sol, limits)
+                # metrics must describe the final layout: use the kept set of
+                # the repaired solution, not the pre-deletion one
+                final, placed, _, kept = _greedy_deletions(req, sol, limits)
                 if final is None:
                     continue
                 candidates.append(

@@ -85,6 +85,27 @@ class SolutionSpec(BaseModel):
     quantize_grid_beats: Optional[float] = Field(None, gt=0, le=4)
     deleted_note_ids: list[str] = Field(default_factory=list)
 
+    @model_validator(mode="after")
+    def _canonical_deletions(self) -> "SolutionSpec":
+        # Deletions are a set: duplicates must not change the pin layout, the
+        # deletion count, the content hash or the resulting version.
+        self.deleted_note_ids = sorted(set(self.deleted_note_ids))
+        return self
+
+
+def tempo_offsets_percent(float_percent: float, step_percent: float) -> list[float]:
+    """Symmetric tempo offsets (percent) within ±float_percent.
+
+    Always contains the base offset 0 and both endpoints, plus interior grid
+    points spaced step_percent apart. Shared by the search-space validator and
+    the engine so their counts never disagree."""
+    offsets = {0.0, -float_percent, float_percent}
+    k = 1
+    while -float_percent + k * step_percent < float_percent - 1e-9:
+        offsets.add(round(-float_percent + k * step_percent, 9))
+        k += 1
+    return sorted(offsets)
+
 
 class SearchLimits(BaseModel):
     max_transpose_semitones: int = Field(3, ge=0, le=12)
@@ -101,7 +122,7 @@ class SearchLimits(BaseModel):
             if g <= 0 or g > 4:
                 raise ValueError("quantize grids must be within (0, 4] beats")
         n_t = 2 * self.max_transpose_semitones + 1
-        n_f = int(round(2 * self.tempo_float_percent / self.tempo_step_percent)) + 1
+        n_f = len(tempo_offsets_percent(self.tempo_float_percent, self.tempo_step_percent))
         n_g = 1 + len(set(self.quantize_grids_beats))
         if n_t * n_f * n_g > 5000:
             raise ValueError(

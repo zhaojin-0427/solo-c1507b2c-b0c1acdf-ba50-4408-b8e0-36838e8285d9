@@ -287,6 +287,56 @@ def test_freeze_with_deletions_marks_them_in_svg(client: TestClient):
     assert 'stroke="#dc3545"' in out["svg"]  # red cross for the deleted note
 
 
+def test_search_and_freeze_metrics_agree(client: TestClient):
+    # regression: a deleted high-beat note must not inflate the search metrics;
+    # the candidate metrics and the frozen-version metrics must be identical
+    arr = make_arrangement([note("a", 4.0, 60), note("late", 100.0, 66)])
+    s = client.post(
+        "/api/arrangements/search",
+        json={
+            "arrangement": arr,
+            "limits": {
+                "max_transpose_semitones": 0,
+                "tempo_float_percent": 5.0,
+                "tempo_step_percent": 5.0,
+                "quantize_grids_beats": [],
+            },
+        },
+    ).json()
+    cand = next(c for c in s["candidates"] if c["solution"]["tempo_factor"] == 1.05)
+    assert cand["solution"]["deleted_note_ids"] == ["late"]
+    assert cand["metrics"]["rhythm_error_seconds"] == 0.095238
+
+    v = client.post(
+        "/api/versions", json={"arrangement": arr, "solution": cand["solution"]}
+    )
+    assert v.status_code == 201
+    assert v.json()["metrics"] == cand["metrics"]
+
+
+def test_freeze_dedupes_duplicate_deleted_ids(client: TestClient):
+    # regression: duplicate deletion ids describe the same effective layout and
+    # must yield the same count, the same hash and the same version
+    arr = make_arrangement([note("a", 2.0, 60), note("b", 2.5, 60)])  # rebound clash
+    r1 = client.post(
+        "/api/versions",
+        json={"arrangement": arr, "solution": {"deleted_note_ids": ["b", "b"]}},
+    )
+    assert r1.status_code == 201
+    body1 = r1.json()
+    assert body1["metrics"]["deleted_count"] == 1
+    assert len(body1["pins"]) == 1
+
+    r2 = client.post(
+        "/api/versions",
+        json={"arrangement": arr, "solution": {"deleted_note_ids": ["b"]}},
+    )
+    assert r2.status_code == 200  # already frozen
+    assert r2.json()["id"] == body1["id"]
+    assert r2.json()["content_hash"] == body1["content_hash"]
+    assert len(client.get("/api/versions").json()) == 1
+
+
 def test_health(client: TestClient):
     r = client.get("/health")
     assert r.status_code == 200

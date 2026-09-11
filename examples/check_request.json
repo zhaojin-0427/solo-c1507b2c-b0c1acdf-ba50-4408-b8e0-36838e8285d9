@@ -1,0 +1,30 @@
+{
+  "bpm": 120.0,
+  "notes": [
+    {"id": "n1", "beat": 0.0, "duration": 0.5, "pitch": 60},
+    {"id": "n2", "beat": 1.0, "duration": 0.5, "pitch": 62},
+    {"id": "n3", "beat": 2.0, "duration": 0.5, "pitch": 64},
+    {"id": "n4", "beat": 3.0, "duration": 0.5, "pitch": 65},
+    {"id": "n5", "beat": 4.0, "duration": 1.0, "pitch": 67, "locked": true},
+    {"id": "n6", "beat": 6.0, "duration": 0.5, "pitch": 69},
+    {"id": "n7", "beat": 7.0, "duration": 0.5, "pitch": 71},
+    {"id": "n8", "beat": 8.0, "duration": 1.0, "pitch": 72}
+  ],
+  "cylinder": {"diameter_mm": 60.0, "effective_length_mm": 80.0, "rpm": 10.0},
+  "comb": [
+    {"pitch": 60, "axial_mm": 10.0},
+    {"pitch": 62, "axial_mm": 18.0},
+    {"pitch": 64, "axial_mm": 26.0},
+    {"pitch": 65, "axial_mm": 34.0},
+    {"pitch": 67, "axial_mm": 42.0},
+    {"pitch": 69, "axial_mm": 50.0},
+    {"pitch": 71, "axial_mm": 58.0},
+    {"pitch": 72, "axial_mm": 66.0}
+  ],
+  "constraints": {
+    "pin_diameter_mm": 2.0,
+    "seam_zone_mm": 10.0,
+    "min_rebound_seconds": 0.3,
+    "min_clearance_mm": 1.0
+  }
+}

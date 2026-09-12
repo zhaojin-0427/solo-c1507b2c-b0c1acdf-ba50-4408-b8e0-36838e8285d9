@@ -20,6 +20,13 @@ CREATE TABLE IF NOT EXISTS versions (
     request_json TEXT NOT NULL,
     result_json TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS balance_plans (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    content_hash TEXT NOT NULL UNIQUE,
+    created_at TEXT NOT NULL,
+    request_json TEXT NOT NULL,
+    result_json TEXT NOT NULL
+);
 """
 
 
@@ -29,7 +36,7 @@ class Store:
         self._conn.row_factory = sqlite3.Row
         self._lock = threading.Lock()
         with self._lock, self._conn:
-            self._conn.execute(SCHEMA)
+            self._conn.executescript(SCHEMA)
 
     def get_by_hash(self, content_hash: str) -> sqlite3.Row | None:
         with self._lock:
@@ -60,6 +67,43 @@ class Store:
     def list(self) -> list[sqlite3.Row]:
         with self._lock:
             cur = self._conn.execute("SELECT * FROM versions ORDER BY id")
+            return cur.fetchall()
+
+    # -- balance plans (same immutability guarantees as versions) -----------
+
+    def get_plan_by_hash(self, content_hash: str) -> sqlite3.Row | None:
+        with self._lock:
+            cur = self._conn.execute(
+                "SELECT * FROM balance_plans WHERE content_hash = ?", (content_hash,)
+            )
+            return cur.fetchone()
+
+    def get_plan(self, plan_id: int) -> sqlite3.Row | None:
+        with self._lock:
+            cur = self._conn.execute(
+                "SELECT * FROM balance_plans WHERE id = ?", (plan_id,)
+            )
+            return cur.fetchone()
+
+    def insert_plan(
+        self, content_hash: str, request_json: str, result_json: str
+    ) -> sqlite3.Row:
+        created_at = datetime.now(timezone.utc).isoformat()
+        with self._lock, self._conn:
+            cur = self._conn.execute(
+                "INSERT INTO balance_plans (content_hash, created_at, request_json,"
+                " result_json) VALUES (?, ?, ?, ?)",
+                (content_hash, created_at, request_json, result_json),
+            )
+            row = self._conn.execute(
+                "SELECT * FROM balance_plans WHERE id = ?", (cur.lastrowid,)
+            ).fetchone()
+            assert row is not None
+            return row
+
+    def list_plans(self) -> list[sqlite3.Row]:
+        with self._lock:
+            cur = self._conn.execute("SELECT * FROM balance_plans ORDER BY id")
             return cur.fetchall()
 
     def close(self) -> None:

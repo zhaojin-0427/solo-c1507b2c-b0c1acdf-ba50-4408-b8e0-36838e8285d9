@@ -11,6 +11,8 @@ from __future__ import annotations
 
 from xml.sax.saxutils import escape
 
+from . import balance_engine as be
+from .balance_models import BalanceSpec, Imbalance
 from .engine import TxNote, circumference, pitch_name
 from .models import ArrangementRequest, Metrics, PinOut, SolutionSpec
 
@@ -133,6 +135,148 @@ def render_unrolled_svg(
             f'fill-opacity="0.8" stroke="#222" stroke-width="0.1">'
             f"<title>{tip}</title></circle>"
         )
+
+    out.append("</svg>")
+    return "\n".join(out)
+
+
+def render_balance_svg(
+    *,
+    content_hash: str,
+    source: "be.SourceInfo",
+    spec: BalanceSpec,
+    locked: list["be.MassPoint"],
+    weights: list["be.MassPoint"],
+    weight_diameters: dict[str, float],
+    imbalance: Imbalance,
+) -> str:
+    """Unrolled cylinder for a balance plan: pins, correction planes, bearing
+    positions and balance weights. Millimetre units, 1:1 when printed."""
+    circ = source.circumference_mm
+    length = source.length_mm
+    width = MARGIN_L + circ + MARGIN_R
+    height = MARGIN_T + length + MARGIN_B
+
+    def X(x_mm: float) -> float:
+        return MARGIN_L + x_mm
+
+    def Y(y_mm: float) -> float:
+        return MARGIN_T + y_mm
+
+    out: list[str] = []
+    out.append(
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{_fmt(width)}mm" '
+        f'height="{_fmt(height)}mm" viewBox="0 0 {_fmt(width)} {_fmt(height)}" '
+        'font-family="monospace">'
+    )
+    out.append(f'<rect x="0" y="0" width="{_fmt(width)}" height="{_fmt(height)}" fill="#ffffff"/>')
+
+    title = (
+        f"balance plan | hash {content_hash[:12]} | "
+        f"static {imbalance.static_gmm} g*mm (limit {spec.residual_limit_gmm}) | "
+        f"couple {imbalance.couple_gmm2} g*mm^2 | weights {len(weights)}"
+    )
+    out.append(
+        f'<text x="{_fmt(MARGIN_L)}" y="8" font-size="3.4" fill="#111">{escape(title)}</text>'
+    )
+
+    # seam forbidden zone (the seam unrolls to both edges of the rectangle)
+    half_seam = source.seam_zone_mm / 2.0
+    if half_seam > 0:
+        out.append(
+            f'<rect x="{_fmt(X(0))}" y="{_fmt(Y(0))}" width="{_fmt(half_seam)}" '
+            f'height="{_fmt(length)}" fill="#f8d7da"/>'
+        )
+        out.append(
+            f'<rect x="{_fmt(X(circ - half_seam))}" y="{_fmt(Y(0))}" '
+            f'width="{_fmt(half_seam)}" height="{_fmt(length)}" fill="#f8d7da"/>'
+        )
+
+    # cylinder outline
+    out.append(
+        f'<rect x="{_fmt(X(0))}" y="{_fmt(Y(0))}" width="{_fmt(circ)}" '
+        f'height="{_fmt(length)}" fill="none" stroke="#333" stroke-width="0.3"/>'
+    )
+
+    # angle ruler along the top edge, one tick every 30 degrees
+    for deg in range(0, 361, 30):
+        x = X(circ * deg / 360.0)
+        out.append(
+            f'<line x1="{_fmt(x)}" y1="{_fmt(Y(0))}" x2="{_fmt(x)}" '
+            f'y2="{_fmt(Y(-2.2))}" stroke="#888" stroke-width="0.15"/>'
+        )
+        out.append(
+            f'<text x="{_fmt(x)}" y="{_fmt(Y(-3.2))}" font-size="2.2" fill="#555" '
+            f'text-anchor="middle">{deg}</text>'
+        )
+
+    # mid-plane (couple reference)
+    mid = length / 2.0
+    out.append(
+        f'<line x1="{_fmt(X(0))}" y1="{_fmt(Y(mid))}" x2="{_fmt(X(circ))}" '
+        f'y2="{_fmt(Y(mid))}" stroke="#bbb" stroke-width="0.15" stroke-dasharray="2 2"/>'
+    )
+    out.append(
+        f'<text x="1" y="{_fmt(Y(mid) + 0.8)}" font-size="2.2" fill="#999">mid</text>'
+    )
+
+    # bearing positions (only drawn when they fall on the cylinder)
+    for label, z in (("BA", spec.bearing_a_mm), ("BB", spec.bearing_b_mm)):
+        if 0.0 <= z <= length:
+            out.append(
+                f'<line x1="{_fmt(X(0))}" y1="{_fmt(Y(z))}" x2="{_fmt(X(circ))}" '
+                f'y2="{_fmt(Y(z))}" stroke="#6c757d" stroke-width="0.2" '
+                f'stroke-dasharray="1 1.6"/>'
+            )
+            out.append(
+                f'<text x="1" y="{_fmt(Y(z) + 0.8)}" font-size="2.2" '
+                f'fill="#6c757d">{label}</text>'
+            )
+
+    # correction planes
+    for label, z in (("P1", spec.plane_1_mm), ("P2", spec.plane_2_mm)):
+        out.append(
+            f'<line x1="{_fmt(X(0))}" y1="{_fmt(Y(z))}" x2="{_fmt(X(circ))}" '
+            f'y2="{_fmt(Y(z))}" stroke="#6f42c1" stroke-width="0.3" '
+            f'stroke-dasharray="4 2"/>'
+        )
+        out.append(
+            f'<text x="1" y="{_fmt(Y(z) - 0.8)}" font-size="2.4" '
+            f'fill="#6f42c1">{label}</text>'
+        )
+
+    # pins: blue = locked note, green = normal
+    r = source.pin_diameter_mm / 2.0
+    for p in source.pins:
+        x = X(p.angle_deg / 360.0 * circ)
+        y = Y(p.axial_mm)
+        fill = "#0b5ed7" if p.locked else "#198754"
+        tip = escape(f"pin {p.note_id} angle {p.angle_deg} deg axial {p.axial_mm} mm")
+        out.append(
+            f'<circle cx="{_fmt(x)}" cy="{_fmt(y)}" r="{_fmt(r)}" fill="{fill}" '
+            f'fill-opacity="0.8" stroke="#222" stroke-width="0.1">'
+            f"<title>{tip}</title></circle>"
+        )
+
+    # balance weights: grey = locked (already mounted), orange = new
+    for pts, fill, tag in ((locked, "#6c757d", "locked"), (weights, "#fd7e14", "new")):
+        for w in pts:
+            d = weight_diameters[w.ref]
+            x = X(w.angle_deg / 360.0 * circ)
+            y = Y(w.axial_mm)
+            tip = escape(
+                f"{tag} weight {w.ref} {w.mass_g} g angle {w.angle_deg} deg "
+                f"axial {w.axial_mm} mm"
+            )
+            out.append(
+                f'<circle cx="{_fmt(x)}" cy="{_fmt(y)}" r="{_fmt(d / 2.0)}" '
+                f'fill="{fill}" fill-opacity="0.65" stroke="#222" '
+                f'stroke-width="0.15"><title>{tip}</title></circle>'
+            )
+            out.append(
+                f'<text x="{_fmt(x)}" y="{_fmt(y + 0.9)}" font-size="2.0" '
+                f'fill="#111" text-anchor="middle">{escape(w.ref)}</text>'
+            )
 
     out.append("</svg>")
     return "\n".join(out)

@@ -1,0 +1,20 @@
+[project]
+name = "musicbox-pin-arranger"
+version = "1.0.0"
+description = "Local API for laying out music-box cylinder pins: geometry, conflict diagnostics, manufacturability search, immutable frozen versions with printable SVG."
+requires-python = ">=3.10"
+dependencies = [
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.27",
+    "pydantic>=2.5",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4",
+    "httpx>=0.26",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]

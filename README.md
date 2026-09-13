@@ -37,6 +37,17 @@ GET  /api/balance/plans/{id}    4. 读取方案：基线/最终不平衡、逐�
 POST /api/balance/plans/{id}/recompute  5. 重算校验
 ```
 
+动力试算（基于已冻结的植钉版本）：
+
+```
+POST /api/dynamics/trials                       1. 建立不可变试算版本（发条/齿轮/惯量/调速器/拨簧耗能）
+POST /api/dynamics/trials/{id}/simulate         2. 固定步长积分滚筒角速度，定位首次停转/超速/节拍漂移
+POST /api/dynamics/trials/{id}/search           3. 搜索预紧圈数 × 调速器系数 × 飞轮惯量候选并排序
+POST /api/dynamics/plans                        4. 冻结选定方案（来源快照 + 曲线 + 步长 + 哈希，幂等）
+GET  /api/dynamics/plans/{id}                   5. 读取方案：参数、场景、完整仿真结果
+POST /api/dynamics/plans/{id}/recompute         6. 重算校验
+```
+
 ### 1. 检查（check）
 
 提交乐谱与机构参数（完整示例见 `examples/check_request.json`）：
@@ -224,6 +235,101 @@ curl -s -X POST localhost:8000/api/balance/plans \
 - `GET /api/balance/plans/{id}/svg` 输出展开图：钉位（绿/蓝）、校正面（紫虚线 P1/P2）、
   轴承位置（灰点线 BA/BB）、中面线、已装配配重（灰）与新配重（橙，标注 id）
 
+## 动力试算
+
+植钉方案确定后，需要验证整曲走时：发条能否驱动滚筒转完所有钉、拨动瞬间掉速多少、
+调速器能否把转速稳在设计值附近。试算版本**独立保存**整套动力参数并引用冻结的植钉版本：
+
+| 字段 | 含义 |
+| --- | ---|
+| `spring_torque` | 发条扭矩曲线：扭矩（mN·m）对**剩余发条圈数**（turns，单调递增横坐标）分段线性 |
+| `gear_train[]` | 齿轮级：`ratio` 为输出（滚筒）转速/输入（条盒）转速；总传动比为各级乘积 |
+|  | `efficiency` 为该级效率（0,1]；总效率为各级乘积 |
+| `spring_torque` 行程 | 横坐标跨度即可用发条行程（圈）；`prewind_turns` 不得超过它 |
+| `base_inertia_g_cm2` | 滚筒轴上旋转组件惯量（g·cm²，1 g·cm² = 1e-7 kg·m²） |
+| `governor_drag` | 调速器阻力矩曲线（mN·m）对滚筒转速（rpm，单调递增横坐标）分段线性 |
+| `pluck_energy_uJ` | 音梳每枚簧片的**单次拨动耗能**（µJ），键为 MIDI 音高，须覆盖全部钉 |
+| `dt_s` | 固定积分步长（秒，默认 1ms，范围 5e-5…0.02） |
+| `stall_rpm_ratio` / `overspeed_rpm_ratio` / `beat_drift_limit` | 停转/超速/节拍漂移阈值 |
+
+校验：来源版本不存在 → 404；曲线横坐标非严格递增、x/y 长度不等、单位不符、负值、
+缺簧片耗能、**可用发条行程不足**（所需条盒圈数 = 滚筒转数/总传动比 > 曲线行程）→ 422。
+
+### 1. 建立试算版本（trial）
+
+```bash
+curl -s -X POST localhost:8000/api/dynamics/trials \
+  -H 'Content-Type: application/json' \
+  -d @examples/dynamics_trial_request.json | jq
+```
+
+返回的 `derived` 给出设计转速、总传动比/效率、换算后的 SI 惯量、整曲所需滚筒转数与
+条盒圈数、可用发条圈数；`pins[]` 是来源版本钉的设计相位（`phase_rev` 不回绕圈数）。
+试算版本不可修改、不可删除；相同来源 + 参数重复创建返回同一版本（幂等）。
+
+### 2. 仿真（simulate）
+
+```bash
+curl -s -X POST localhost:8000/api/dynamics/trials/1/simulate \
+  -H 'Content-Type: application/json' \
+  -d @examples/dynamics_simulate_request.json | jq
+```
+
+仿真以设计转速为初速度，按 `dt_s` 固定步长积分：
+
+```
+驱动扭矩（滚筒轴）= 发条扭矩(剩余圈数) / 总传动比 × 总效率
+净扭矩            = 驱动扭矩 − 调速器系数 × 调速器阻力矩(转速)
+越过钉的设计相位：ω_after = √(ω² − 2E拨动/J)     （同刻和弦合并为一次拨动）
+剩余圈数          = 预紧圈数 − 滚筒累计转角/2π/总传动比
+```
+
+返回：
+
+- `curves`：`t_s` / `rpm` / `torque_margin_mNm`（驱动−调速器的扭矩余量）等距采样曲线
+- `pluck_events[]`：每次拨动的实际时刻、拨动前后转速、**到下一次拨动前的最低转速**、
+  相对设计节拍间隔的漂移比、耗能；同刻多钉合并为一个事件
+- `summary`：是否走完全程（`completed`）、**累计走时**、已用/剩余发条圈数、全程最低转速、
+  最小扭矩余量、最大节拍漂移、违规计数
+- `first_violations`：**首次停转、超速、节拍漂移的钉位（pin_index + note_ids）与时刻**；
+  未发生为 null
+
+### 3. 方案搜索（search）
+
+```bash
+curl -s -X POST localhost:8000/api/dynamics/trials/1/search \
+  -H 'Content-Type: application/json' \
+  -d @examples/dynamics_search_request.json | jq
+```
+
+- 调用方可 `gear_ratio_lock` **锁定传动比**；否则取 `gear_ratio_candidates`
+  （缺省为存储的总传动比）
+- 网格枚举 预紧圈数 × 调速器系数 × 飞轮惯量（附加到滚筒轴）；预紧超过可用行程的点跳过
+- 排序字典序：**违规总数 → 最大节拍偏差 → 最小扭矩余量（越大越前）→
+  剩余发条行程（越大越前）**，再用参数元组保证确定性
+- 候选含完整指标、逐拨动最低转速序列与首次违规定位；`feasible` 表示存在零违规方案
+
+### 4. 冻结选定方案（plan）
+
+```bash
+curl -s -X POST localhost:8000/api/dynamics/plans \
+  -H 'Content-Type: application/json' \
+  -d @examples/dynamics_plan_request.json | jq
+```
+
+- 冻结**来源快照（版本哈希 + 钉位相位）、输入曲线、积分步长 `dt_s`、解析后的场景与输入哈希**；
+  方案自包含，重算不依赖试算或来源版本是否仍在库
+- **幂等**：相同输入返回同一方案（HTTP 200）；不可修改、不可删除
+
+### 5. 重算校验
+
+```bash
+curl -s -X POST localhost:8000/api/dynamics/plans/1/recompute | jq
+# {"id":1,"match":true,"stored_hash":"...","recomputed_hash":"..."}
+```
+
+从库内快照与曲线重新积分，逐字段比对曲线/事件/汇总与哈希。引擎为纯函数，同一方案
+重复计算（含跨进程）结果一致。
 
 ## 项目结构
 
@@ -234,11 +340,14 @@ musicbox/
   balance_models.py  动平衡请求/响应模型与校验
   balance_engine.py  旋转质量矢量、不平衡计算、配重搜索（纯函数，确定性）
   balance_freeze.py  平衡方案的规范化哈希与冻结载荷构建
+  dynamics_models.py 动力试算请求/响应模型与曲线、单位、参数范围校验
+  dynamics_engine.py 固定步长滚筒角速度积分、拨动负载、方案搜索（纯函数，确定性）
+  dynamics_freeze.py 试算版本与动力方案的规范化哈希与冻结载荷构建
   svg.py             滚筒展开图渲染（毫米单位，1:1 打印）
   freeze.py          规范化哈希与冻结载荷构建（植钉）
-  store.py           SQLite 版本存储（只增不改：versions + balance_plans）
+  store.py           SQLite 版本存储（只增不改：versions + balance_plans + dynamics_*）
   main.py            FastAPI 路由
-tests/        pytest：引擎单元测试 + API 集成测试（79 项）
+tests/        pytest：引擎单元测试 + API 集成测试（104 项）
 examples/     示例请求
 ```
 
@@ -251,3 +360,7 @@ examples/     示例请求
   力偶 g·mm²、轴承载荷 mN（峰值，载荷按 ω² 缩放，保留 9 位小数以免低载荷下失真）
 - 配重搜索：1–2 枚配重穷举（标准双面校正为精确解），3 枚及以上由束搜索
   （宽度 32）扩展；目标值在 1e-9 处取整，消除浮点噪声对排序的干扰
+- 动力试算单位约定：扭矩 mN·m、能量 µJ、惯量 g·cm²、转速 rpm，内部统一换算为 SI；
+  曲线分段线性插值，端点外取端值；拨动耗能以动能冲量形式在越过钉相位的步内按线性
+  插值时刻施加，和弦同刻合并。步长是被冻结的输入（默认 1ms）：换步长会改变数值结果，
+  但同一步长重复积分逐字节一致

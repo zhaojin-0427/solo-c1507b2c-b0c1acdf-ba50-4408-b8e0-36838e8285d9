@@ -1,0 +1,5 @@
+{
+  "prewind_turns": 2.0,
+  "governor_coefficient": 1.0,
+  "flywheel_inertia_g_cm2": 0.0
+}

@@ -1,0 +1,8 @@
+{
+  "trial_id": 1,
+  "scenario": {
+    "prewind_turns": 2.0,
+    "governor_coefficient": 1.1,
+    "flywheel_inertia_g_cm2": 200.0
+  }
+}

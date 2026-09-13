@@ -1,0 +1,8 @@
+{
+  "gear_ratio_lock": null,
+  "gear_ratio_candidates": [],
+  "prewind_turns": [1.5, 2.0, 2.5],
+  "governor_coefficients": [0.9, 1.0, 1.1],
+  "flywheel_inertia_g_cm2": [0.0, 200.0],
+  "max_candidates": 10
+}

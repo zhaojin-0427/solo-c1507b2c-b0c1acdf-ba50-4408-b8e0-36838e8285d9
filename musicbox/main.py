@@ -12,7 +12,7 @@ import os
 
 from fastapi import Depends, FastAPI, HTTPException, Response
 
-from . import __version__, balance_engine, balance_freeze, engine, freeze
+from . import __version__, balance_engine, balance_freeze, dynamics_engine, dynamics_freeze, engine, freeze
 from .balance_models import (
     BalanceAnalyzeRequest,
     BalanceAnalyzeResponse,
@@ -36,6 +36,23 @@ from .models import (
 )
 from .store import Store
 from .balance_engine import BalancePlanError
+from .dynamics_models import (
+    CandidateMetrics,
+    DynamicsPlanResponse,
+    DynamicsPlanSummary,
+    DynamicsRecomputeResponse,
+    DynamicsSpec,
+    PlanFreezeRequest,
+    ScenarioCandidate,
+    ScenarioParams,
+    ScenarioSearchRequest,
+    ScenarioSearchResponse,
+    SimulateResponse,
+    TrialCreateRequest,
+    TrialResponse,
+    TrialSummary,
+)
+from .dynamics_engine import DynamicsError
 
 IDENTITY = SolutionSpec()
 
@@ -341,6 +358,279 @@ def create_app(db_path: str | None = None) -> FastAPI:
         new_hash, new_result = balance_freeze.recompute_plan(request_dict)
         match = new_hash == row["content_hash"] and new_result == stored_result
         return BalanceRecomputeResponse(
+            id=row["id"],
+            match=match,
+            stored_hash=row["content_hash"],
+            recomputed_hash=new_hash,
+        )
+
+    # -- powertrain dynamics trials ------------------------------------------
+
+    def _load_dynamics_source(store: Store, version_id: int) -> dynamics_engine.DynamicsSource:
+        row = store.get(version_id)
+        if row is None:
+            raise HTTPException(status_code=404, detail="source version not found")
+        return dynamics_engine.source_from_version_row(row)
+
+    def _load_trial(store: Store, trial_id: int) -> tuple:
+        row = store.get_trial(trial_id)
+        if row is None:
+            raise HTTPException(status_code=404, detail="dynamics trial not found")
+        request = json.loads(row["request_json"])
+        result = json.loads(row["result_json"])
+        source = dynamics_engine.DynamicsSource.from_snapshot_dict(
+            {
+                "version_id": request["source_version_id"],
+                "content_hash": result["source_content_hash"],
+                "design_rpm": result["derived"]["design_rpm"],
+                "pins": result["pins"],
+            }
+        )
+        return row, request, result, source
+
+    def _trial_response(row) -> TrialResponse:
+        request = json.loads(row["request_json"])
+        result = json.loads(row["result_json"])
+        return TrialResponse(
+            id=row["id"],
+            content_hash=row["content_hash"],
+            created_at=row["created_at"],
+            source_version_id=request["source_version_id"],
+            source_content_hash=result["source_content_hash"],
+            spec=request["spec"],
+            derived=result["derived"],
+            pins=result["pins"],
+        )
+
+    @app.post("/api/dynamics/trials", response_model=TrialResponse, status_code=201)
+    def create_dynamics_trial(
+        body: TrialCreateRequest, response: Response, store: Store = Depends(get_store)
+    ) -> TrialResponse:
+        """Create an immutable dynamics trial: mainspring torque curve, gear
+        ratios and efficiencies, inertia, governor drag curve and per-reed
+        pluck energies, referencing a frozen pin-arrangement version. Rejected
+        (404/422) when the source version is missing, a curve abscissa is not
+        strictly increasing, or the usable mainspring travel is insufficient."""
+        source = _load_dynamics_source(store, body.source_version_id)
+        try:
+            content_hash, request_dict, result_dict = dynamics_freeze.build_trial_payload(
+                source, body.spec
+            )
+        except DynamicsError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        existing = store.get_trial_by_hash(content_hash)
+        if existing is not None:
+            response.status_code = 200
+            return _trial_response(existing)
+        row = store.insert_trial(
+            content_hash,
+            freeze.canonical_json(request_dict),
+            json.dumps(result_dict, ensure_ascii=False, sort_keys=True),
+        )
+        return _trial_response(row)
+
+    @app.get("/api/dynamics/trials", response_model=list[TrialSummary])
+    def list_dynamics_trials(store: Store = Depends(get_store)) -> list[TrialSummary]:
+        out = []
+        for row in store.list_trials():
+            result = json.loads(row["result_json"])
+            out.append(
+                TrialSummary(
+                    id=row["id"],
+                    content_hash=row["content_hash"],
+                    created_at=row["created_at"],
+                    source_version_id=json.loads(row["request_json"])["source_version_id"],
+                    pin_count=len(result["pins"]),
+                )
+            )
+        return out
+
+    @app.get("/api/dynamics/trials/{trial_id}", response_model=TrialResponse)
+    def get_dynamics_trial(trial_id: int, store: Store = Depends(get_store)) -> TrialResponse:
+        row = store.get_trial(trial_id)
+        if row is None:
+            raise HTTPException(status_code=404, detail="dynamics trial not found")
+        return _trial_response(row)
+
+    @app.post(
+        "/api/dynamics/trials/{trial_id}/simulate",
+        response_model=SimulateResponse,
+    )
+    def simulate_dynamics(
+        trial_id: int,
+        body: ScenarioParams,
+        store: Store = Depends(get_store),
+    ) -> SimulateResponse:
+        """Integrate cylinder angular velocity at the trial's fixed step and
+        apply pluck loads as each pin design phase is crossed. Returns speed and
+        torque-margin curves, the post-pluck minimum speeds, accumulated run
+        time and the pin/time of the first stall, overspeed and beat drift."""
+        row, _request, result, source = _load_trial(store, trial_id)
+        spec = DynamicsSpec.model_validate(json.loads(row["request_json"])["spec"])
+        try:
+            sim = dynamics_engine.simulate(spec, source, body, keep_curves=True)
+        except DynamicsError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return SimulateResponse(
+            trial_id=trial_id,
+            source_content_hash=result["source_content_hash"],
+            **sim.model_dump(mode="json"),
+        )
+
+    @app.post(
+        "/api/dynamics/trials/{trial_id}/search",
+        response_model=ScenarioSearchResponse,
+    )
+    def search_scenarios(
+        trial_id: int,
+        body: ScenarioSearchRequest,
+        store: Store = Depends(get_store),
+    ) -> ScenarioSearchResponse:
+        """Search prewind × governor coefficient × flywheel inertia grids,
+        optionally locking the gear ratio. Plans are ranked by violation count,
+        then maximum beat deviation, keeping larger torque margins and larger
+        remaining mainspring travel first."""
+        row, _request, _result, source = _load_trial(store, trial_id)
+        spec = DynamicsSpec.model_validate(json.loads(row["request_json"])["spec"])
+        stored_ratio = dynamics_engine.total_ratio(spec)
+        if body.gear_ratio_lock is not None:
+            ratios = [body.gear_ratio_lock]
+        elif body.gear_ratio_candidates:
+            ratios = list(body.gear_ratio_candidates)
+        else:
+            ratios = [stored_ratio]
+        try:
+            scored, evaluated = dynamics_engine.search_scenarios(
+                spec,
+                source,
+                ratios=ratios,
+                prewinds=body.prewind_turns,
+                coefficients=body.governor_coefficients,
+                inertias=body.flywheel_inertia_g_cm2,
+                max_candidates=body.max_candidates,
+            )
+        except DynamicsError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        if not scored:
+            raise HTTPException(
+                status_code=422,
+                detail="no feasible scenario: every prewind exceeds the usable "
+                "mainspring travel",
+            )
+        candidates = [
+            ScenarioCandidate(
+                rank=i + 1,
+                scenario=c["scenario"],
+                metrics=CandidateMetrics(
+                    violation_count=c["summary"].violation_count,
+                    max_beat_drift_ratio=c["summary"].max_beat_drift_ratio,
+                    min_torque_margin_mNm=c["summary"].min_torque_margin_mNm,
+                    remaining_spring_turns=c["summary"].remaining_spring_turns,
+                    min_rpm=c["summary"].min_rpm,
+                    total_time_s=c["summary"].total_time_s,
+                    completed=c["summary"].completed,
+                ),
+                pluck_min_rpm=c["pluck_min_rpm"],
+                first_violations=c["first_violations"],
+            )
+            for i, c in enumerate(scored)
+        ]
+        return ScenarioSearchResponse(
+            feasible=any(c.metrics.violation_count == 0 for c in candidates),
+            combinations_evaluated=evaluated,
+            candidates=candidates,
+        )
+
+    def _dynamics_plan_response(row) -> DynamicsPlanResponse:
+        request = json.loads(row["request_json"])
+        result = json.loads(row["result_json"])
+        return DynamicsPlanResponse(
+            id=row["id"],
+            content_hash=row["content_hash"],
+            created_at=row["created_at"],
+            trial_content_hash=request["trial_content_hash"],
+            source_version_id=request["source"]["version_id"],
+            source_content_hash=request["source"]["content_hash"],
+            spec=request["spec"],
+            scenario=result["scenario"],
+            dt_s=request["dt_s"],
+            result=result,
+        )
+
+    @app.post(
+        "/api/dynamics/plans", response_model=DynamicsPlanResponse, status_code=201
+    )
+    def freeze_dynamics_plan(
+        body: PlanFreezeRequest, response: Response, store: Store = Depends(get_store)
+    ) -> DynamicsPlanResponse:
+        """Freeze a chosen scenario: source snapshot, input curves, integration
+        step, resolved scenario and input hash; recomputation is self-contained
+        and bit-identical. Idempotent: the same input yields the same plan."""
+        row, request, _result, source = _load_trial(store, body.trial_id)
+        trial_hash = row["content_hash"]
+        spec = DynamicsSpec.model_validate(request["spec"])
+        try:
+            content_hash, request_dict, result_dict = dynamics_freeze.build_plan_payload(
+                source, spec, body.scenario
+            )
+        except DynamicsError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        request_dict["trial_content_hash"] = trial_hash
+        request_dict["dt_s"] = spec.dt_s
+        existing = store.get_dynamics_plan_by_hash(content_hash)
+        if existing is not None:
+            response.status_code = 200
+            return _dynamics_plan_response(existing)
+        new_row = store.insert_dynamics_plan(
+            content_hash,
+            freeze.canonical_json(request_dict),
+            json.dumps(result_dict, ensure_ascii=False, sort_keys=True),
+        )
+        return _dynamics_plan_response(new_row)
+
+    @app.get("/api/dynamics/plans", response_model=list[DynamicsPlanSummary])
+    def list_dynamics_plans(store: Store = Depends(get_store)) -> list[DynamicsPlanSummary]:
+        out = []
+        for row in store.list_dynamics_plans():
+            request = json.loads(row["request_json"])
+            result = json.loads(row["result_json"])
+            out.append(
+                DynamicsPlanSummary(
+                    id=row["id"],
+                    content_hash=row["content_hash"],
+                    created_at=row["created_at"],
+                    trial_content_hash=request["trial_content_hash"],
+                    violation_count=result["summary"]["violation_count"],
+                )
+            )
+        return out
+
+    @app.get("/api/dynamics/plans/{plan_id}", response_model=DynamicsPlanResponse)
+    def get_dynamics_plan(
+        plan_id: int, store: Store = Depends(get_store)
+    ) -> DynamicsPlanResponse:
+        row = store.get_dynamics_plan(plan_id)
+        if row is None:
+            raise HTTPException(status_code=404, detail="dynamics plan not found")
+        return _dynamics_plan_response(row)
+
+    @app.post(
+        "/api/dynamics/plans/{plan_id}/recompute",
+        response_model=DynamicsRecomputeResponse,
+    )
+    def recompute_dynamics_plan(
+        plan_id: int, store: Store = Depends(get_store)
+    ) -> DynamicsRecomputeResponse:
+        """Recompute a frozen plan from its stored source snapshot and curves;
+        the result must be bit-identical (same content hash, same curves)."""
+        row = store.get_dynamics_plan(plan_id)
+        if row is None:
+            raise HTTPException(status_code=404, detail="dynamics plan not found")
+        request_dict = json.loads(row["request_json"])
+        stored_result = json.loads(row["result_json"])
+        new_hash, new_result = dynamics_freeze.recompute_plan(request_dict)
+        match = new_hash == row["content_hash"] and new_result == stored_result
+        return DynamicsRecomputeResponse(
             id=row["id"],
             match=match,
             stored_hash=row["content_hash"],

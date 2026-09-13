@@ -1,0 +1,31 @@
+{
+  "source_version_id": 1,
+  "spec": {
+    "spring_torque": {
+      "x": [0.0, 3.0, 6.0, 9.0, 12.0],
+      "y": [2.6, 3.4, 3.9, 4.1, 4.0],
+      "x_unit": "turns",
+      "y_unit": "mN*m"
+    },
+    "gear_train": [
+      {"ratio": 2.0, "efficiency": 0.96},
+      {"ratio": 5.0, "efficiency": 0.94}
+    ],
+    "base_inertia_g_cm2": 100.0,
+    "governor_drag": {
+      "x": [0.0, 5.0, 8.0, 10.0, 12.0, 15.0, 30.0],
+      "y": [0.0, 0.12, 0.23, 0.36, 0.55, 0.9, 2.4],
+      "x_unit": "rpm",
+      "y_unit": "mN*m"
+    },
+    "pluck_energy_uJ": {
+      "60": 0.5,
+      "62": 0.5,
+      "64": 0.5
+    },
+    "dt_s": 0.001,
+    "stall_rpm_ratio": 0.6,
+    "overspeed_rpm_ratio": 1.25,
+    "beat_drift_limit": 0.1
+  }
+}

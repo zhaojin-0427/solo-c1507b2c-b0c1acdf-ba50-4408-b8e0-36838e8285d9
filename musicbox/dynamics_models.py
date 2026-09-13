@@ -149,20 +149,28 @@ class ScenarioSearchRequest(BaseModel):
 
     @model_validator(mode="after")
     def _checks(self) -> "ScenarioSearchRequest":
-        for name, values in (
-            ("gear_ratio_candidates", self.gear_ratio_candidates),
-            ("prewind_turns", self.prewind_turns),
-            ("governor_coefficients", self.governor_coefficients),
-            ("flywheel_inertia_g_cm2", self.flywheel_inertia_g_cm2),
-        ):
-            if any(v < 0 for v in values):
-                raise ValueError(f"{name} must be non-negative")
-        for v in self.prewind_turns:
-            if v <= 0:
-                raise ValueError("prewind_turns must be positive")
+        # Candidate grids share the single-scenario bounds, so an out-of-range
+        # candidate is rejected at the request (422), not deep in the search.
         for v in self.gear_ratio_candidates:
-            if v <= 0:
-                raise ValueError("gear ratio candidates must be positive")
+            if not 0.0 < v <= 10000.0:
+                raise ValueError(
+                    f"gear_ratio_candidates must be within (0, 10000], got {v}"
+                )
+        for v in self.prewind_turns:
+            if not 0.0 < v <= 100000.0:
+                raise ValueError(
+                    f"prewind_turns must be within (0, 100000], got {v}"
+                )
+        for v in self.governor_coefficients:
+            if not 0.0 <= v <= 100.0:
+                raise ValueError(
+                    f"governor_coefficients must be within [0, 100], got {v}"
+                )
+        for v in self.flywheel_inertia_g_cm2:
+            if not 0.0 <= v <= 1e9:
+                raise ValueError(
+                    f"flywheel_inertia_g_cm2 must be within [0, 1e9], got {v}"
+                )
         return self
 
 

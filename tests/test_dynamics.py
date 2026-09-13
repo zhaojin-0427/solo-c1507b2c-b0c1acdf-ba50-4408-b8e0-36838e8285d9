@@ -202,6 +202,43 @@ def test_prewind_beyond_travel_is_rejected():
         de.simulate(spec(), make_source(), scenario(prewind_turns=100.0))
 
 
+def test_post_pluck_speed_carries_into_next_step_with_zero_drive():
+    # zero drive and zero drag: without torque the only speed changes are the
+    # pluck impulses; the post-pluck velocity must persist into the next step
+    # instead of snapping back to the design speed
+    s = spec(
+        spring_torque={"x": [0.0, 12.0], "y": [0.0, 0.0],
+                        "x_unit": "turns", "y_unit": "mN*m"},
+        governor_drag={"x": [0.0, 100.0], "y": [0.0, 0.0],
+                       "x_unit": "rpm", "y_unit": "mN*m"},
+        pluck_energy_uJ={"60": 50.0, "62": 50.0, "64": 50.0},
+    )
+    pins = [
+        DynamicsPin(note_id=nid, pitch=p, design_time_s=t,
+                    angle_deg=(t * 360.0) % 360.0, phase_rev=t / 60.0)
+        for nid, p, t in [("a", 60, 1.0), ("b", 62, 2.0), ("c", 64, 3.0)]
+    ]
+    src = de.build_source(1, "h", 60.0, pins)
+    res = de.simulate(s, src, scenario(prewind_turns=10.0))
+
+    e0, e1, e2 = res.pluck_events
+    assert e0.rpm_before == pytest.approx(60.0, abs=1e-4)
+    assert e0.rpm_after == pytest.approx(51.84698, abs=1e-4)
+    # the next pin must fire from the slowed speed, not from a restored 60 rpm
+    assert e1.rpm_before == pytest.approx(e0.rpm_after, abs=1e-4)
+    assert e1.rpm_after == pytest.approx(42.14521, abs=1e-4)
+    assert e2.rpm_before == pytest.approx(e1.rpm_after, abs=1e-4)
+    # the speed curve between the plucks stays flat at the slowed value
+    between = [
+        r for tt, r in zip(res.curves.t_s, res.curves.rpm)
+        if e0.time_s + res.dt_s <= tt < e1.time_s
+    ]
+    assert between and all(abs(r - 51.84698) < 1e-4 for r in between)
+    # with no drive the third pluck drops below the stall threshold
+    assert res.summary.stall is True
+    assert res.first_violations["stall"].pin_index == 2
+
+
 def test_gear_ratio_override_reflects_drive_and_travel():
     res = de.simulate(spec(), make_source(), scenario(gear_ratio=12.0))
     assert res.scenario.gear_ratio == 12.0
@@ -408,6 +445,21 @@ def test_search_rejects_non_positive_ratio_candidate(client: TestClient):
         json={"gear_ratio_candidates": [0.0], "prewind_turns": [2.0]},
     )
     assert r.status_code == 422
+
+
+def test_search_rejects_candidates_outside_single_scenario_bounds(client: TestClient):
+    # out-of-range grid values must be 422 at the request, never 500 from the
+    # internal ScenarioParams construction
+    tid = create_trial(client, freeze_version(client)).json()["id"]
+    for grid, value in (
+        ("governor_coefficients", 101.0),
+        ("flywheel_inertia_g_cm2", 2.0e9),
+        ("prewind_turns", 200000.0),
+        ("gear_ratio_candidates", 20000.0),
+    ):
+        body = {"prewind_turns": [2.0], grid: [value]}
+        r = client.post(f"/api/dynamics/trials/{tid}/search", json=body)
+        assert r.status_code == 422, (grid, r.status_code)
 
 
 # ---------------------------------------------------------------------------

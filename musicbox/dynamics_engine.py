@@ -342,33 +342,77 @@ def simulate(
     max_steps = int(design_song_s * TIME_BUDGET_MULTIPLE / dt) + 16
 
     steps = 0
-    fired_total: list[PluckEvent] = []
+    fired_count = 0
+    n_events = len(source.events)
     while steps < max_steps:
         steps += 1
-        margin = margin_at(omega, used_barrel)
-        min_margin = min(min_margin, margin)
-        alpha = margin / J
-        new_omega = max(0.0, omega + alpha * dt)
-        new_theta = theta + omega * dt + 0.5 * alpha * dt * dt
-
-        # fire every pin phase crossed inside this step; a cursor guarantees
-        # each event fires exactly once (events at phase 0 fire in step one)
-        fired = []
-        cursor = len(fired_total)
-        while cursor < len(source.events) and (
-            source.events[cursor].phase_rev * 2.0 * math.pi <= new_theta + EPS
-        ):
-            fired.append(source.events[cursor])
-            cursor += 1
-
+        # Integrate the fixed dt step as constant-acceleration kinematics,
+        # splitting it into sub-segments at every pin phase crossing. The
+        # post-pluck velocity is the initial velocity of the next sub-segment,
+        # so a pluck's energy loss carries into later steps (no snap-back).
+        cur_t = t
+        cur_theta = theta
+        cur_omega = omega
+        cur_used = used_barrel
+        h_remaining = dt
         stall_in_step = False
-        for e in fired:
+
+        while True:
+            margin = margin_at(cur_omega, cur_used)
+            min_margin = min(min_margin, margin)
+            alpha = margin / J
+
+            # deceleration to a full stop inside this sub-segment
+            if alpha < 0.0 and cur_omega + alpha * h_remaining <= 0.0:
+                h_stop = cur_omega / -alpha
+                cur_t += h_stop
+                cur_theta += cur_omega * h_stop + 0.5 * alpha * h_stop * h_stop
+                cur_omega = 0.0
+                cur_used = cur_theta / (2.0 * math.pi) / ratio
+                t, theta, omega, used_barrel = cur_t, cur_theta, cur_omega, cur_used
+                min_omega = min(min_omega, cur_omega)
+                mark_stall(
+                    source.events[fired_count - 1].index if fired_count else None,
+                    cur_omega,
+                    f"speed dropped to 0 rpm (stall threshold "
+                    f"{r6(_rpm(stall_omega))} rpm)",
+                )
+                stall_in_step = True
+                break
+
+            end_omega = max(0.0, cur_omega + alpha * h_remaining)
+            end_theta = (
+                cur_theta
+                + cur_omega * h_remaining
+                + 0.5 * alpha * h_remaining * h_remaining
+            )
+
+            next_event = (
+                source.events[fired_count] if fired_count < n_events else None
+            )
+            crosses = (
+                next_event is not None
+                and next_event.phase_rev * 2.0 * math.pi <= end_theta + EPS
+            )
+            if not crosses:
+                cur_t += h_remaining
+                cur_theta = end_theta
+                cur_omega = end_omega
+                cur_used = cur_theta / (2.0 * math.pi) / ratio
+                break
+
+            e = next_event
             cross_theta = e.phase_rev * 2.0 * math.pi
-            # linear intra-step crossing time
-            frac = (cross_theta - theta) / max(new_theta - theta, EPS)
-            t_cross = t + min(max(frac, 0.0), 1.0) * dt
-            w_before = omega + alpha * min(max(frac, 0.0), 1.0) * dt
-            w_before = max(0.0, w_before)
+            dtheta = cross_theta - cur_theta
+            if abs(alpha) <= EPS:
+                tau = dtheta / max(cur_omega, EPS)
+            else:
+                # 0.5*alpha*tau^2 + omega*tau = dtheta  (positive root)
+                disc = cur_omega * cur_omega + 2.0 * alpha * dtheta
+                tau = (-cur_omega + math.sqrt(max(0.0, disc))) / alpha
+            tau = min(max(tau, 0.0), h_remaining)
+            t_cross = cur_t + tau
+            w_before = max(0.0, cur_omega + alpha * tau)
             w2 = w_before * w_before - 2.0 * e.energy_J / J
             w_after = math.sqrt(max(0.0, w2))
 
@@ -423,13 +467,16 @@ def simulate(
                     energy_uJ=r6(e.energy_J / ENERGY_UJ_TO_J),
                 )
             )
-            omega = w_after
-            min_omega = min(min_omega, w_after)
+            fired_count += 1
+            cur_t = t_cross
+            cur_theta = cross_theta
+            cur_omega = w_after
+            cur_used = cur_theta / (2.0 * math.pi) / ratio
+            h_remaining -= tau
+            min_omega = min(min_omega, w_before, w_after)
+
             if w_after <= stall_omega + EPS:
-                t = t_cross
-                theta = cross_theta
-                used_barrel = theta / (2.0 * math.pi) / ratio
-                fired_total.extend(fired)
+                t, theta, omega, used_barrel = cur_t, cur_theta, cur_omega, cur_used
                 mark_stall(
                     e.index,
                     w_after,
@@ -439,21 +486,18 @@ def simulate(
                 stall_in_step = True
                 break
 
+        # commit the integrated step state
+        t, theta, omega, used_barrel = cur_t, cur_theta, cur_omega, cur_used
+        segment_min = min(segment_min, omega)
+        min_omega = min(min_omega, omega)
+
         if stall_in_step:
             sample(omega, used_barrel)
             break
 
-        t += dt
-        theta = new_theta
-        omega = new_omega
-        fired_total.extend(fired)
-        used_barrel = theta / (2.0 * math.pi) / ratio
-        segment_min = min(segment_min, omega)
-        min_omega = min(min_omega, omega)
-
         if omega <= stall_omega + EPS:
             mark_stall(
-                out_events[-1].index if out_events else None,
+                source.events[fired_count - 1].index if fired_count else None,
                 omega,
                 f"speed {r6(_rpm(omega))} rpm at/below stall threshold "
                 f"{r6(_rpm(stall_omega))} rpm",
@@ -464,8 +508,14 @@ def simulate(
             overspeed = True
             first["overspeed"] = ViolationLoc(
                 kind="overspeed",
-                pin_index=out_events[-1].index if out_events else None,
-                note_ids=list(out_events[-1].note_ids) if out_events else [],
+                pin_index=(
+                    source.events[fired_count - 1].index if fired_count else None
+                ),
+                note_ids=(
+                    list(source.events[fired_count - 1].note_ids)
+                    if fired_count
+                    else []
+                ),
                 time_s=r6(t),
                 rpm=r6(_rpm(omega)),
                 detail=(
@@ -475,12 +525,12 @@ def simulate(
             )
 
         sample(omega, used_barrel)
-        if len(out_events) == len(source.events):
+        if fired_count == n_events:
             break
     else:
         # step budget exhausted without reaching all pins: treat as a stall
         mark_stall(
-            out_events[-1].index if out_events else None,
+            source.events[fired_count - 1].index if fired_count else None,
             omega,
             "integration step budget exhausted before the tune finished",
         )

@@ -15,6 +15,7 @@ import hashlib
 from . import balance_engine as be
 from .balance_models import (
     BalanceFreezeRequest,
+    BalanceSearchLimits,
     BalanceSpec,
     WeightRef,
 )
@@ -27,6 +28,7 @@ def build_plan_payload(
     spec: BalanceSpec,
     locked: list[WeightRef],
     weights: list[WeightRef],
+    limits: BalanceSearchLimits,
 ) -> tuple[str, dict, dict]:
     """Compute a frozen balance plan. Returns (content_hash, request_dict,
     result_dict); result_dict holds baseline/final imbalance, per-pin
@@ -47,12 +49,14 @@ def build_plan_payload(
         "spec": spec.model_dump(mode="json"),
         "locked_weights": [w.model_dump(mode="json") for w in locked],
         "weights": [w.model_dump(mode="json") for w in weights],
+        "limits": limits.model_dump(mode="json"),
     }
     core = {
         "source_content_hash": source.content_hash,
         "spec": request_dict["spec"],
         "locked_weights": request_dict["locked_weights"],
         "weights": request_dict["weights"],
+        "limits": request_dict["limits"],
         "pins": [c.model_dump(mode="json") for c in contributions],
         "imbalance": final.model_dump(mode="json"),
     }
@@ -84,10 +88,11 @@ def recompute_plan(request_dict: dict) -> tuple[str, dict]:
             "spec": request_dict["spec"],
             "locked_weights": request_dict["locked_weights"],
             "weights": request_dict["weights"],
+            "limits": request_dict.get("limits", {}),
         }
     )
     source = be.SourceInfo.from_snapshot_dict(request_dict["source"])
     content_hash, _, result_dict = build_plan_payload(
-        source, req.spec, req.locked_weights, req.weights
+        source, req.spec, req.locked_weights, req.weights, req.limits
     )
     return content_hash, result_dict

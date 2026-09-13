@@ -1,0 +1,68 @@
+{
+  "source_version_id": 1,
+  "spec": {
+    "shell_mass_g": 200.0,
+    "pin_height_mm": 4.0,
+    "default_pin_mass_g": 0.045,
+    "pin_masses": {
+      "n5": 0.06
+    },
+    "working_rpm": 10.0,
+    "bearing_a_mm": -5.0,
+    "bearing_b_mm": 85.0,
+    "plane_1_mm": 16.0,
+    "plane_2_mm": 64.0,
+    "residual_limit_gmm": 0.05,
+    "inventory": [
+      {
+        "id": "S",
+        "mass_g": 0.02,
+        "diameter_mm": 3.0,
+        "quantity": 10
+      },
+      {
+        "id": "M",
+        "mass_g": 0.05,
+        "diameter_mm": 4.0,
+        "quantity": 8
+      },
+      {
+        "id": "L",
+        "mass_g": 0.1,
+        "diameter_mm": 5.0,
+        "quantity": 4
+      }
+    ]
+  },
+  "locked_weights": [
+    {
+      "weight_id": "M",
+      "plane": 1,
+      "angle_deg": 210.0
+    }
+  ],
+  "weights": [
+    {
+      "weight_id": "S",
+      "plane": 1,
+      "angle_deg": 240.0
+    },
+    {
+      "weight_id": "M",
+      "plane": 1,
+      "angle_deg": 315.0
+    },
+    {
+      "weight_id": "L",
+      "plane": 2,
+      "angle_deg": 345.0
+    }
+  ],
+  "limits": {
+    "angle_step_deg": 15.0,
+    "pin_clearance_mm": 1.0,
+    "seam_clearance_mm": 2.0,
+    "max_weights": 4,
+    "max_candidates": 5
+  }
+}

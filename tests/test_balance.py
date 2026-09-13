@@ -108,8 +108,8 @@ def test_single_pin_imbalance_hand_computed():
     assert imb.total_mass_g == 200.045
     assert imb.com_offset_mm == be.r6(1.44 / 200.045)
     # bearings at 0 and 80 mm: reactions 70/80 and 10/80 of U
-    assert imb.bearing_a_load_mn == be.r6(1.44 * 0.875 * OMEGA2 * 1e-3)
-    assert imb.bearing_b_load_mn == be.r6(1.44 * 0.125 * OMEGA2 * 1e-3)
+    assert imb.bearing_a_load_mn == be.r9(1.44 * 0.875 * OMEGA2 * 1e-3)
+    assert imb.bearing_b_load_mn == be.r9(1.44 * 0.125 * OMEGA2 * 1e-3)
     assert imb.within_limit is False  # 1.44 > 0.01 limit
 
 
@@ -140,7 +140,7 @@ def test_symmetric_pins_cancel_static_but_keep_couple():
     assert imb.couple_gmm2 == 86.4  # 2 * 1.44 * 30
     # pure couple -> equal and opposite bearing reactions
     assert imb.bearing_a_load_mn == imb.bearing_b_load_mn
-    assert imb.bearing_a_load_mn == be.r6(1.44 * 0.75 * OMEGA2 * 1e-3)
+    assert imb.bearing_a_load_mn == be.r9(1.44 * 0.75 * OMEGA2 * 1e-3)
 
 
 def test_static_imbalance_is_independent_of_working_rpm():
@@ -148,9 +148,9 @@ def test_static_imbalance_is_independent_of_working_rpm():
     slow = be.compute_imbalance(spec(working_rpm=5.0), src, be.pin_points(spec(), src))
     fast = be.compute_imbalance(spec(working_rpm=50.0), src, be.pin_points(spec(), src))
     assert slow.static_gmm == fast.static_gmm
-    # load scales with omega^2 = (rpm)^2
+    # load scales with omega^2 = (rpm)^2; rounding must not destroy the ratio
     ratio = fast.bearing_a_load_mn / slow.bearing_a_load_mn
-    assert ratio == pytest.approx(100.0, rel=1e-4)
+    assert ratio == pytest.approx(100.0, rel=1e-6)
 
 
 def test_ideal_correction_matches_hand_solution():
@@ -301,6 +301,20 @@ def test_search_max_weights_zero_returns_baseline_only():
     assert candidates[0].residual.static_gmm == 1.44
 
 
+def test_search_max_weights_one_uses_singles_only():
+    sp = spec()
+    src = source([PIN_A])
+    candidates, _ = be.search_weights(
+        sp, src, be.pin_points(sp, src), [], limits(max_weights=1)
+    )
+    assert candidates
+    assert all(c.residual.weight_count <= 1 for c in candidates)
+    # best single weight: A at 240 deg on either plane (static residual 0.36)
+    best = candidates[0]
+    assert best.residual.static_gmm == 0.36
+    assert [(w.weight_id, w.angle_deg) for w in best.weights] == [("A", 240.0)]
+
+
 def test_search_deterministic():
     sp = spec()
     src = source([PIN_A, be.SourcePin("b", 200.0, 50.0, False)])
@@ -441,6 +455,23 @@ def test_search_unknown_source_404(client: TestClient):
     assert r.status_code == 404
 
 
+def test_search_max_weights_zero_via_api(client: TestClient, source_id: int):
+    r = client.post(
+        "/api/balance/search",
+        json={
+            "source_version_id": source_id,
+            "spec": make_spec(),
+            "limits": {"max_weights": 0},
+        },
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["feasible"] is False
+    assert len(body["candidates"]) == 1
+    assert body["candidates"][0]["weights"] == []
+    assert body["candidates"][0]["residual"]["static_gmm"] == 1.44
+
+
 def freeze_plan(client: TestClient, source_id: int, **overrides) -> dict:
     body = {
         "source_version_id": source_id,
@@ -484,6 +515,29 @@ def test_freeze_plan_is_idempotent(client: TestClient, source_id: int):
     assert r1.json()["content_hash"] == r2.json()["content_hash"]
     assert r1.json()["svg"] == r2.json()["svg"]
     assert len(client.get("/api/balance/plans").json()) == 1
+
+
+def test_freeze_plan_stores_search_limits(client: TestClient, source_id: int):
+    # the search limits the plan was chosen under must be frozen with it
+    search_limits = {
+        "angle_step_deg": 10.0,
+        "pin_clearance_mm": 1.5,
+        "seam_clearance_mm": 3.0,
+        "max_weights": 3,
+        "max_candidates": 4,
+    }
+    r = freeze_plan(client, source_id, limits=search_limits)
+    assert r.status_code == 201, r.text
+    body = r.json()
+    assert body["limits"] == search_limits
+    fetched = client.get(f"/api/balance/plans/{body['id']}").json()
+    assert fetched["limits"] == search_limits
+    rec = client.post(f"/api/balance/plans/{body['id']}/recompute").json()
+    assert rec["match"] is True
+    # different limits -> different input hash -> a separate plan
+    other = freeze_plan(client, source_id)
+    assert other.json()["content_hash"] != body["content_hash"]
+    assert other.json()["limits"]["angle_step_deg"] == 15.0  # default
 
 
 def test_freeze_plan_unknown_source_404(client: TestClient):

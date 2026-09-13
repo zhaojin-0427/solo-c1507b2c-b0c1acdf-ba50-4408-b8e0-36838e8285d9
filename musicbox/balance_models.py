@@ -127,6 +127,10 @@ class BalanceFreezeRequest(BaseModel):
     weights: list[WeightRef] = Field(
         default_factory=list, description="chosen new weights from the search"
     )
+    limits: BalanceSearchLimits = Field(
+        default_factory=lambda: BalanceSearchLimits(),
+        description="search limits the weights were chosen under (kept for traceability)",
+    )
 
     @model_validator(mode="after")
     def _canonical(self) -> "BalanceFreezeRequest":
@@ -251,6 +255,7 @@ class BalancePlanResponse(BaseModel):
     spec: BalanceSpec
     locked_weights: list[WeightRef]
     weights: list[WeightRef]
+    limits: BalanceSearchLimits
     baseline: Imbalance = Field(description="before the chosen weights")
     imbalance: Imbalance = Field(description="final state with all weights")
     pins: list[PinContribution]

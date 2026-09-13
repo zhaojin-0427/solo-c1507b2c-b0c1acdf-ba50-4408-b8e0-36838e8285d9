@@ -260,6 +260,7 @@ def create_app(db_path: str | None = None) -> FastAPI:
             spec=request["spec"],
             locked_weights=request["locked_weights"],
             weights=request["weights"],
+            limits=request.get("limits", {}),
             baseline=result["baseline"],
             imbalance=result["imbalance"],
             pins=result["pins"],
@@ -277,7 +278,7 @@ def create_app(db_path: str | None = None) -> FastAPI:
         source = _load_source(store, body.source_version_id)
         try:
             content_hash, request_dict, result_dict = balance_freeze.build_plan_payload(
-                source, body.spec, body.locked_weights, body.weights
+                source, body.spec, body.locked_weights, body.weights, body.limits
             )
         except BalancePlanError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc

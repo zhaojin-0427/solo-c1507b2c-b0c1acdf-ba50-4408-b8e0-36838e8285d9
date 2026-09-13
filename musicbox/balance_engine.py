@@ -12,6 +12,7 @@ no ambient state, so recomputing a frozen plan yields identical output.
 
 from __future__ import annotations
 
+import json
 import math
 from collections import Counter
 from dataclasses import dataclass
@@ -33,6 +34,13 @@ from .engine import r6
 
 EPS = 1e-9
 BEAM_WIDTH = 32  # plans kept per weight-count level during the search
+
+
+def r9(x: float) -> float:
+    """Round small magnitudes (bearing loads) for stable output. Six decimals
+    would destroy the omega^2 scaling at music-box load levels (sub-mN)."""
+    v = round(float(x), 9)
+    return 0.0 if v == 0 else v
 
 
 class BalancePlanError(ValueError):
@@ -119,8 +127,6 @@ class SourceInfo:
 
 def source_from_version_row(row) -> SourceInfo:
     """Build the source snapshot from a stored pin-arrangement version row."""
-    import json
-
     request = json.loads(row["request_json"])
     result = json.loads(row["result_json"])
     arr = request["arrangement"]
@@ -313,8 +319,8 @@ def compute_imbalance(
         static_angle_deg=_angle_of(u),
         couple_gmm2=r6(abs(m)),
         couple_angle_deg=_angle_of(m),
-        bearing_a_load_mn=r6(abs(reaction_a) * to_mn),
-        bearing_b_load_mn=r6(abs(reaction_b) * to_mn),
+        bearing_a_load_mn=r9(abs(reaction_a) * to_mn),
+        bearing_b_load_mn=r9(abs(reaction_b) * to_mn),
         within_limit=abs(u) <= spec.residual_limit_gmm + EPS,
     )
 
@@ -551,9 +557,12 @@ def search_weights(
                     pairs.append(tuple(sorted((p, q), key=_placement_key)))
         for plan in pairs:
             add(plan)
-        beam = sorted(pairs, key=lambda p: scored[p])[:BEAM_WIDTH]
-    else:
-        beam = sorted(singles, key=lambda p: scored[p])[:BEAM_WIDTH]
+
+    # deeper levels are beam-searched from the best evaluated plans so far
+    beam: list[tuple[_Placement, ...]] = []
+    if limits.max_weights >= 3:
+        pool = [p for p in scored if 0 < len(p) < limits.max_weights]
+        beam = sorted(pool, key=lambda p: scored[p])[:BEAM_WIDTH]
 
     for _level in range(3, limits.max_weights + 1):
         nxt: list[tuple[_Placement, ...]] = []

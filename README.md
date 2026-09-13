@@ -27,6 +27,16 @@ GET  /api/versions/{id}         4. 读取版本：钉坐标、冲突余量、输
 POST /api/versions/{id}/recompute  5. 重算校验：结果必须与冻结时完全一致
 ```
 
+动平衡（基于已冻结的植钉版本）：
+
+```
+POST /api/balance/analyze       1. 不平衡分析：质心偏移、静不平衡、力偶、轴承载荷、逐钉贡献
+POST /api/balance/search        2. 从配重库存搜索校正配重并排序
+POST /api/balance/plans         3. 把选定配重方案冻结为不可变版本（幂等）
+GET  /api/balance/plans/{id}    4. 读取方案：基线/最终不平衡、逐钉贡献、SVG
+POST /api/balance/plans/{id}/recompute  5. 重算校验
+```
+
 ### 1. 检查（check）
 
 提交乐谱与机构参数（完整示例见 `examples/check_request.json`）：
@@ -150,17 +160,85 @@ curl -s -X POST localhost:8000/api/versions/1/recompute | jq
 从库中保存的原始请求重新计算，逐字段比对 pins/metrics/SVG 与哈希。
 引擎是纯函数（无时钟、无随机、无环境依赖），同一版本重复计算必然得到相同结果。
 
+## 动平衡
+
+滚筒植钉后质量分布不再均匀，工作转速下会产生静不平衡与力偶不平衡。动平衡流程从
+**已冻结的植钉版本**取数（滚筒几何 + 每枚钉的角度/轴向位置），机械参数独立保存：
+
+| 字段 | 含义 |
+| --- | --- |
+| `shell_mass_g` | 滚筒壳体质量（克） |
+| `pin_height_mm` | 钉高（质心半径 = 筒半径 + 钉高/2） |
+| `default_pin_mass_g` / `pin_masses` | 默认钉质量与逐钉质量（键为来源版本的 note_id） |
+| `working_rpm` | 工作转速（轴承载荷按 ω² 计算） |
+| `bearing_a_mm` / `bearing_b_mm` | 两轴承轴向位置（可在筒外） |
+| `plane_1_mm` / `plane_2_mm` | 两个校正面轴向位置（必须在筒长范围内） |
+| `residual_limit_gmm` | 残余静不平衡上限（g·mm） |
+| `inventory[]` | 配重库存：每种配重的 `mass_g`、`diameter_mm`、`quantity` |
+
+### 1. 不平衡分析（analyze）
+
+```bash
+curl -s -X POST localhost:8000/api/balance/analyze \
+  -H 'Content-Type: application/json' \
+  -d @examples/balance_analyze_request.json | jq
+```
+
+把每枚钉换算为旋转质量矢量（质量 × 质心半径，按角度合成复矢量），返回：
+
+- `imbalance`：质心偏移 `com_offset_mm`、静不平衡 `static_gmm`（及方向角）、
+  相对中面的力偶 `couple_gmm2`、两轴承峰值载荷 `bearing_*_load_mn`（mN）、是否达标
+- `pins[]`：逐钉贡献（静不平衡与力偶的 x/y 分量）
+- `ideal_correction`：理论双面校正（各校正面所需质量与角度，供参考）
+- 可附带 `locked_weights`（已装配配重），计入不平衡但不参与搜索
+
+校验：来源版本不存在 → 404；逐钉质量引用未知钉号、校正面或配重越出筒长、
+配重 id 未知、用量超库存、配重互相重叠 → 422；单位与几何范围由 Pydantic 核对。
+
+### 2. 配重搜索（search）
+
+```bash
+curl -s -X POST localhost:8000/api/balance/search \
+  -H 'Content-Type: application/json' \
+  -d @examples/balance_search_request.json | jq
+```
+
+- 调用方可锁定已装配配重（`locked_weights`，消耗库存），并设置
+  `angle_step_deg`（角度步长）、`pin_clearance_mm`（钉位安全距）、
+  `seam_clearance_mm`（接缝安全距）、`max_weights`（最多配重数）
+- 在库存余量内枚举配重位置：1–2 枚配重的方案穷举，更深方案由束搜索扩展；
+  越出筒长、违反钉位/接缝安全距、与已装配配重干涉的位置一律排除
+- 候选按字典序排序：**残余静不平衡 → 残余力偶 → 附加质量 → 配重数**
+
+### 3. 冻结平衡方案（freeze）
+
+```bash
+curl -s -X POST localhost:8000/api/balance/plans \
+  -H 'Content-Type: application/json' \
+  -d @examples/balance_freeze_request.json | jq
+```
+
+- 冻结来源快照（版本哈希 + 滚筒几何 + 钉位）、机械参数、搜索限制与输入哈希；
+  方案自包含，重算不依赖来源版本是否仍在库中
+- **幂等**：相同输入重复冻结返回同一方案（HTTP 200）；方案不可修改、不可删除
+- `GET /api/balance/plans/{id}/svg` 输出展开图：钉位（绿/蓝）、校正面（紫虚线 P1/P2）、
+  轴承位置（灰点线 BA/BB）、中面线、已装配配重（灰）与新配重（橙，标注 id）
+
+
 ## 项目结构
 
 ```
 musicbox/
-  models.py   Pydantic 请求/响应模型与校验
-  engine.py   几何换算、冲突诊断、方案搜索（纯函数，确定性）
-  svg.py      滚筒展开图渲染（毫米单位，1:1 打印）
-  freeze.py   规范化哈希与冻结载荷构建
-  store.py    SQLite 版本存储（只增不改）
-  main.py     FastAPI 路由
-tests/        pytest：引擎单元测试 + API 集成测试（43 项）
+  models.py          Pydantic 请求/响应模型与校验（植钉）
+  engine.py          几何换算、冲突诊断、方案搜索（纯函数，确定性）
+  balance_models.py  动平衡请求/响应模型与校验
+  balance_engine.py  旋转质量矢量、不平衡计算、配重搜索（纯函数，确定性）
+  balance_freeze.py  平衡方案的规范化哈希与冻结载荷构建
+  svg.py             滚筒展开图渲染（毫米单位，1:1 打印）
+  freeze.py          规范化哈希与冻结载荷构建（植钉）
+  store.py           SQLite 版本存储（只增不改：versions + balance_plans）
+  main.py            FastAPI 路由
+tests/        pytest：引擎单元测试 + API 集成测试（79 项）
 examples/     示例请求
 ```
 
@@ -169,3 +247,7 @@ examples/     示例请求
 - 冲突检测为 O(n²) 钉对扫描，搜索复杂度为 组合数 × O(n²)；
   音乐盒曲目规模（数十至数百音符）在本机为亚秒至数秒级
 - 搜索空间上限 5000 组合，超出返回 422，请收窄移调范围或速度步长
+- 动平衡单位约定：质量 g、长度 mm、角度 度、转速 rpm；静不平衡 g·mm、
+  力偶 g·mm²、轴承载荷 mN（峰值，载荷按 ω² 缩放，保留 9 位小数以免低载荷下失真）
+- 配重搜索：1–2 枚配重穷举（标准双面校正为精确解），3 枚及以上由束搜索
+  （宽度 32）扩展；目标值在 1e-9 处取整，消除浮点噪声对排序的干扰

@@ -1,0 +1,15 @@
+{
+  "limits": {
+    "shim_thicknesses_mm": [0.05, 0.1, 0.2],
+    "max_shims_per_end": 2,
+    "comb_shift_range_mm": 0.4,
+    "comb_shift_step_mm": 0.05,
+    "comb_height_range_mm": 0.3,
+    "comb_height_step_mm": 0.05,
+    "lock_bearing_a": false,
+    "lock_bearing_b": false,
+    "lock_comb_shift": false,
+    "lock_comb_height": false,
+    "max_candidates": 5
+  }
+}

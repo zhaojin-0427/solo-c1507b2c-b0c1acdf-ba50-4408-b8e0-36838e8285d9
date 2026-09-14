@@ -1,0 +1,32 @@
+{
+  "source_version_id": 1,
+  "spec": {
+    "length_unit": "mm",
+    "angle_unit": "deg",
+    "runout": {
+      "datum_points_mm": [10.0, 70.0],
+      "angles_deg": [0.0, 90.0, 180.0, 270.0],
+      "values_mm": [
+        [0.030, 0.012, -0.006, 0.008],
+        [0.018, -0.004, 0.010, 0.002]
+      ]
+    },
+    "bearing_a_mm": 0.0,
+    "bearing_b_mm": 80.0,
+    "bearing_a_height_mm": 0.0,
+    "bearing_b_height_mm": -0.06,
+    "default_pin_height_mm": 4.0,
+    "pin_heights_mm": {"n5": 4.05},
+    "reeds": [
+      {"pitch": 60, "axial_mm": 10.0, "height_mm": 33.62, "width_mm": 1.8, "max_pluck_depth_mm": 1.0},
+      {"pitch": 62, "axial_mm": 18.0, "height_mm": 33.60, "width_mm": 1.8, "max_pluck_depth_mm": 1.0},
+      {"pitch": 64, "axial_mm": 26.0, "height_mm": 33.58, "width_mm": 1.8, "max_pluck_depth_mm": 1.0},
+      {"pitch": 65, "axial_mm": 34.0, "height_mm": 33.61, "width_mm": 1.8, "max_pluck_depth_mm": 1.0},
+      {"pitch": 67, "axial_mm": 42.0, "height_mm": 33.59, "width_mm": 1.8, "max_pluck_depth_mm": 1.0},
+      {"pitch": 69, "axial_mm": 50.0, "height_mm": 33.60, "width_mm": 1.8, "max_pluck_depth_mm": 1.0},
+      {"pitch": 71, "axial_mm": 58.0, "height_mm": 33.57, "width_mm": 1.8, "max_pluck_depth_mm": 1.0},
+      {"pitch": 72, "axial_mm": 66.0, "height_mm": 33.58, "width_mm": 1.8, "max_pluck_depth_mm": 1.0}
+    ],
+    "min_engagement_mm": 0.2
+  }
+}

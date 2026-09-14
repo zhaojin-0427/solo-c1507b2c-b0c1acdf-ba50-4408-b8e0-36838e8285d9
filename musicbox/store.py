@@ -41,6 +41,21 @@ CREATE TABLE IF NOT EXISTS dynamics_plans (
     request_json TEXT NOT NULL,
     result_json TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS calibration_batches (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    content_hash TEXT NOT NULL UNIQUE,
+    created_at TEXT NOT NULL,
+    request_json TEXT NOT NULL,
+    result_json TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS calibration_plans (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    content_hash TEXT NOT NULL UNIQUE,
+    batch_hash TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    request_json TEXT NOT NULL,
+    result_json TEXT NOT NULL
+);
 """
 
 
@@ -188,6 +203,62 @@ class Store:
 
     def list_dynamics_plans(self) -> list[sqlite3.Row]:
         return self._generic_list("dynamics_plans")
+
+    # -- calibration batches and plans (same immutability guarantees) --------
+    #
+    # A batch row never changes: its status (collecting -> confirmed) is
+    # derived from whether a calibration plan references its content hash.
+
+    def get_cal_batch(self, batch_id: int) -> sqlite3.Row | None:
+        return self._generic_get("calibration_batches", batch_id)
+
+    def get_cal_batch_by_hash(self, content_hash: str) -> sqlite3.Row | None:
+        return self._generic_get_by_hash("calibration_batches", content_hash)
+
+    def insert_cal_batch(
+        self, content_hash: str, request_json: str, result_json: str
+    ) -> sqlite3.Row:
+        return self._generic_insert(
+            "calibration_batches", content_hash, request_json, result_json
+        )
+
+    def list_cal_batches(self) -> list[sqlite3.Row]:
+        return self._generic_list("calibration_batches")
+
+    def get_cal_plan(self, plan_id: int) -> sqlite3.Row | None:
+        return self._generic_get("calibration_plans", plan_id)
+
+    def get_cal_plan_by_hash(self, content_hash: str) -> sqlite3.Row | None:
+        return self._generic_get_by_hash("calibration_plans", content_hash)
+
+    def get_cal_plan_for_batch(self, batch_hash: str) -> sqlite3.Row | None:
+        """The first plan confirmed on a batch, if any (drives its status)."""
+        with self._lock:
+            cur = self._conn.execute(
+                "SELECT * FROM calibration_plans WHERE batch_hash = ? ORDER BY id"
+                " LIMIT 1",
+                (batch_hash,),
+            )
+            return cur.fetchone()
+
+    def insert_cal_plan(
+        self, content_hash: str, batch_hash: str, request_json: str, result_json: str
+    ) -> sqlite3.Row:
+        created_at = datetime.now(timezone.utc).isoformat()
+        with self._lock, self._conn:
+            cur = self._conn.execute(
+                "INSERT INTO calibration_plans (content_hash, batch_hash, created_at,"
+                " request_json, result_json) VALUES (?, ?, ?, ?, ?)",
+                (content_hash, batch_hash, created_at, request_json, result_json),
+            )
+            row = self._conn.execute(
+                "SELECT * FROM calibration_plans WHERE id = ?", (cur.lastrowid,)
+            ).fetchone()
+            assert row is not None
+            return row
+
+    def list_cal_plans(self) -> list[sqlite3.Row]:
+        return self._generic_list("calibration_plans")
 
     def close(self) -> None:
         with self._lock:

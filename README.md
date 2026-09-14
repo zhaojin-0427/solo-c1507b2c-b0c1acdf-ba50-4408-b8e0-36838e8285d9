@@ -48,6 +48,17 @@ GET  /api/dynamics/plans/{id}                   5. 读取方案：参数、场�
 POST /api/dynamics/plans/{id}/recompute         6. 重算校验
 ```
 
+装配校准（基于已冻结的植钉版本）：
+
+```
+POST /api/calibration/batches                1. 建立校准批次（采集中）：跳动/轴承/钉高/簧片测量，拟合轴线
+GET  /api/calibration/batches/{id}           2. 读取批次：拟合参数、逐钉接触/偏差/拨入量/余量、首违规定位
+POST /api/calibration/batches/{id}/search    3. 在锁定约束内搜索轴承垫片 × 音梳横移 × 高度方案并排序
+POST /api/calibration/batches/{id}/confirm   4. 确认选定调整 → 冻结校准方案（幂等），批次转为已确认
+GET  /api/calibration/plans/{id}             5. 读取已确认方案
+POST /api/calibration/plans/{id}/recompute   6. 重算校验
+```
+
 ### 1. 检查（check）
 
 提交乐谱与机构参数（完整示例见 `examples/check_request.json`）：
@@ -331,23 +342,105 @@ curl -s -X POST localhost:8000/api/dynamics/plans/1/recompute | jq
 从库内快照与曲线重新积分，逐字段比对曲线/事件/汇总与哈希。引擎为纯函数，同一方案
 重复计算（含跨进程）结果一致。
 
+## 装配校准
+
+植钉滚筒装上机架后，滚筒轴线相对音梳会有倾斜与偏心，钉与簧片的对位也会漂移。
+校准批次从**已冻结的植钉版本**取数（滚筒几何 + 每枚钉的角度/轴向位置/音高），
+把装配测量独立保存；批次状态在 **采集中 → 已确认** 之间流转（确认任一方案后即为
+已确认，行本身不可变）。
+
+机架坐标系：z 沿滚筒轴向，x 指向音梳。轴承高度定位旋转轴；径向跳动是壳面相对
+旋转轴的有符号半径偏差（正 = 半径偏大），测量角度与植钉版本同参考（0° = 接缝）。
+
+| 字段 | 含义 |
+| --- | --- |
+| `runout` | 径向跳动网格：`datum_points_mm` 基准点（≥2，严格递增）、`angles_deg` 测角（≥3，严格递增）、`values_mm` 每基准点一行读数 |
+| `bearing_a_mm` / `bearing_b_mm` | 两轴承轴向位置（可在筒外） |
+| `bearing_a_height_mm` / `bearing_b_height_mm` | 两轴承实测高度（旋转轴在机架中的位置） |
+| `default_pin_height_mm` / `pin_heights_mm` | 默认钉高与逐钉钉高（键为来源版本的 note_id） |
+| `reeds[]` | 每片簧片尖端：`axial_mm` 轴向位置、`height_mm` 尖端高度、`width_mm` 轴向宽度、`max_pluck_depth_mm` 允许拨入量 |
+| `min_engagement_mm` | 发声所需最小拨入量 |
+| `length_unit` / `angle_unit` | 单位声明，仅接受 `"mm"` / `"deg"` |
+
+测点、单位和覆盖范围由 FastAPI/Pydantic 与引擎共同校验：基准点/测角严格递增、
+网格行列对齐、簧片不重叠、最小拨入量小于每片簧片的允许拨入量（422）；基准点落在
+筒长内且**覆盖全部钉的轴向范围**、每个钉音高都有实测簧片、逐钉钉高引用已知钉号（422）。
+
+### 1. 建立校准批次（采集中）
+
+```bash
+curl -s -X POST localhost:8000/api/calibration/batches \
+  -H 'Content-Type: application/json' \
+  -d @examples/calibration_batch_request.json | jq
+```
+
+对每个基准点把跳动拟合为 r(θ) = a + b·cosθ + c·sinθ（(b,c) 即该处壳体偏心矢量，
+a 为平均半径偏差），再沿轴向拟合直线得到**滚筒轴线与偏心**；逐钉解析返回：
+
+- `contacted_pitches` **实际接触簧片**、`axial_deviation_mm` 轴向偏差、
+  `pluck_depth_mm` 拨入量及 `axial_margin_mm` / `depth_margin_mm` 余量
+- `diagnostics.first_by_kind`：**漏拨、错拨相邻簧片、同时擦碰两片、拨入过深**
+  四类违规各自的首个钉位（pin_index + note_id）
+
+```
+钉尖高度 = 轴承插值的轴线高度(z) + 筒半径 + 拟合跳动(z, θ) + 钉高
+拨入量   = 钉尖高度 − 簧片尖端高度
+```
+
+违规判定：与目标簧片无轴向重叠或拨入量不足 → 漏拨；只碰到相邻簧片 → 错拨；
+同时重叠两片 → 擦碰两片；拨入量超过允许值 → 过深。相同来源 + 测量重复建批返回
+同一批次（幂等）。
+
+### 2. 调整方案搜索（search）
+
+```bash
+curl -s -X POST localhost:8000/api/calibration/batches/1/search \
+  -H 'Content-Type: application/json' \
+  -d @examples/calibration_search_request.json | jq
+```
+
+- 制作者可 `lock_bearing_a` / `lock_bearing_b` / `lock_comb_shift` / `lock_comb_height`
+  **锁定不可改的轴承或音梳位置**（对应维度固定为 0）
+- 枚举 两端轴承垫片（库存厚度、每端至多 `max_shims_per_end` 片的所有可达总厚）×
+  音梳横移（±range 对称网格）× 高度调整（±range 对称网格）
+- 候选按字典序排序：**违规数 → 最小余量（越大越前）→ 调整量 → 垫片种数**，
+  再以调整元组保证确定性；同一总厚的垫片分解取 种数最少、片数最少 的代表
+
+### 3. 确认（confirm）与重算
+
+```bash
+curl -s -X POST localhost:8000/api/calibration/batches/1/confirm \
+  -H 'Content-Type: application/json' \
+  -d @examples/calibration_confirm_request.json | jq
+```
+
+- 校验选定调整在包络内（锁定维度为 0、范围内、垫片总厚可达），否则 422
+- 冻结**来源快照（版本哈希 + 滚筒几何 + 钉位）、全部测量、拟合参数、选定调整
+  （垫片分解到库存厚度）与输入哈希**；方案自包含，重算不依赖来源版本是否在库
+- **幂等**：相同调整 + 包络重复确认返回同一方案（HTTP 200）；批次随即转为已确认
+- `POST /api/calibration/plans/{id}/recompute` 从库内快照重算并逐字段比对，
+  结果逐字节一致
+
 ## 项目结构
 
 ```
 musicbox/
-  models.py          Pydantic 请求/响应模型与校验（植钉）
-  engine.py          几何换算、冲突诊断、方案搜索（纯函数，确定性）
-  balance_models.py  动平衡请求/响应模型与校验
-  balance_engine.py  旋转质量矢量、不平衡计算、配重搜索（纯函数，确定性）
-  balance_freeze.py  平衡方案的规范化哈希与冻结载荷构建
-  dynamics_models.py 动力试算请求/响应模型与曲线、单位、参数范围校验
-  dynamics_engine.py 固定步长滚筒角速度积分、拨动负载、方案搜索（纯函数，确定性）
-  dynamics_freeze.py 试算版本与动力方案的规范化哈希与冻结载荷构建
-  svg.py             滚筒展开图渲染（毫米单位，1:1 打印）
-  freeze.py          规范化哈希与冻结载荷构建（植钉）
-  store.py           SQLite 版本存储（只增不改：versions + balance_plans + dynamics_*）
-  main.py            FastAPI 路由
-tests/        pytest：引擎单元测试 + API 集成测试（104 项）
+  models.py              Pydantic 请求/响应模型与校验（植钉）
+  engine.py              几何换算、冲突诊断、方案搜索（纯函数，确定性）
+  balance_models.py      动平衡请求/响应模型与校验
+  balance_engine.py      旋转质量矢量、不平衡计算、配重搜索（纯函数，确定性）
+  balance_freeze.py      平衡方案的规范化哈希与冻结载荷构建
+  dynamics_models.py     动力试算请求/响应模型与曲线、单位、参数范围校验
+  dynamics_engine.py     固定步长滚筒角速度积分、拨动负载、方案搜索（纯函数，确定性）
+  dynamics_freeze.py     试算版本与动力方案的规范化哈希与冻结载荷构建
+  calibration_models.py  装配校准请求/响应模型与测点、单位、包络校验
+  calibration_engine.py  滚筒轴线/偏心拟合、逐钉接触解析、调整搜索（纯函数，确定性）
+  calibration_freeze.py  校准批次与确认方案的规范化哈希与冻结载荷构建
+  svg.py                 滚筒展开图渲染（毫米单位，1:1 打印）
+  freeze.py              规范化哈希与冻结载荷构建（植钉）
+  store.py               SQLite 版本存储（只增不改：versions + balance_plans + dynamics_* + calibration_*）
+  main.py                FastAPI 路由
+tests/        pytest：引擎单元测试 + API 集成测试（138 项）
 examples/     示例请求
 ```
 
@@ -364,3 +457,6 @@ examples/     示例请求
   曲线分段线性插值，端点外取端值；拨动耗能以动能冲量形式在越过钉相位的步内按线性
   插值时刻施加，和弦同刻合并。步长是被冻结的输入（默认 1ms）：换步长会改变数值结果，
   但同一步长重复积分逐字节一致
+- 装配校准单位约定：长度 mm、角度 度；跳动拟合为闭式最小二乘（每基准点 3×3 简正
+  方程 + 沿轴直线拟合），完全确定；调整搜索上限 20000 组合，超出返回 422，
+  请收窄垫片规格、调整范围或步长

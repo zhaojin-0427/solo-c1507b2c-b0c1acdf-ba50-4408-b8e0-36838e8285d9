@@ -12,7 +12,7 @@ import os
 
 from fastapi import Depends, FastAPI, HTTPException, Response
 
-from . import __version__, balance_engine, balance_freeze, dynamics_engine, dynamics_freeze, engine, freeze
+from . import __version__, balance_engine, balance_freeze, calibration_engine, calibration_freeze, dynamics_engine, dynamics_freeze, engine, freeze
 from .balance_models import (
     BalanceAnalyzeRequest,
     BalanceAnalyzeResponse,
@@ -22,6 +22,18 @@ from .balance_models import (
     BalanceRecomputeResponse,
     BalanceSearchRequest,
     BalanceSearchResponse,
+)
+from .calibration_models import (
+    CalibrationBatchRequest,
+    CalibrationBatchResponse,
+    CalibrationBatchSummary,
+    CalibrationConfirmRequest,
+    CalibrationPlanResponse,
+    CalibrationPlanSummary,
+    CalibrationRecomputeResponse,
+    CalibrationSearchRequest,
+    CalibrationSearchResponse,
+    CalibrationSpec,
 )
 from .models import (
     ArrangementRequest,
@@ -36,6 +48,7 @@ from .models import (
 )
 from .store import Store
 from .balance_engine import BalancePlanError
+from .calibration_engine import CalibrationError
 from .dynamics_models import (
     CandidateMetrics,
     DynamicsPlanResponse,
@@ -65,7 +78,8 @@ def create_app(db_path: str | None = None) -> FastAPI:
             "Lay out score notes as pins on a music-box cylinder: geometry "
             "conversion, conflict diagnostics, manufacturability search and "
             "immutable frozen versions with printable SVG unrolls. Includes "
-            "two-plane dynamic balancing of the pinned cylinder."
+            "two-plane dynamic balancing, powertrain dynamics trials and "
+            "assembly calibration of the pinned cylinder against the comb."
         ),
     )
     app.state.store = Store(db_path or os.environ.get("MUSICBOX_DB", "musicbox.db"))
@@ -631,6 +645,239 @@ def create_app(db_path: str | None = None) -> FastAPI:
         new_hash, new_result = dynamics_freeze.recompute_plan(request_dict)
         match = new_hash == row["content_hash"] and new_result == stored_result
         return DynamicsRecomputeResponse(
+            id=row["id"],
+            match=match,
+            stored_hash=row["content_hash"],
+            recomputed_hash=new_hash,
+        )
+
+    # -- assembly calibration -------------------------------------------------
+
+    def _load_cal_source(store: Store, version_id: int) -> calibration_engine.CalSource:
+        row = store.get(version_id)
+        if row is None:
+            raise HTTPException(status_code=404, detail="source version not found")
+        return calibration_engine.source_from_version_row(row)
+
+    def _load_cal_batch(store: Store, batch_id: int) -> tuple:
+        row = store.get_cal_batch(batch_id)
+        if row is None:
+            raise HTTPException(status_code=404, detail="calibration batch not found")
+        request = json.loads(row["request_json"])
+        result = json.loads(row["result_json"])
+        source = calibration_engine.CalSource.from_snapshot_dict(result["source"])
+        spec = CalibrationSpec.model_validate(request["spec"])
+        return row, request, result, source, spec
+
+    def _cal_batch_response(row, store: Store) -> CalibrationBatchResponse:
+        request = json.loads(row["request_json"])
+        result = json.loads(row["result_json"])
+        plan = store.get_cal_plan_for_batch(row["content_hash"])
+        return CalibrationBatchResponse(
+            id=row["id"],
+            content_hash=row["content_hash"],
+            created_at=row["created_at"],
+            status="confirmed" if plan is not None else "collecting",
+            confirmed_plan_id=plan["id"] if plan is not None else None,
+            source_version_id=request["source_version_id"],
+            source_content_hash=result["source_content_hash"],
+            spec=request["spec"],
+            fit=result["fit"],
+            pins=result["pins"],
+            diagnostics=result["diagnostics"],
+            summary=result["summary"],
+        )
+
+    @app.post(
+        "/api/calibration/batches",
+        response_model=CalibrationBatchResponse,
+        status_code=201,
+    )
+    def create_calibration_batch(
+        body: CalibrationBatchRequest, response: Response, store: Store = Depends(get_store)
+    ) -> CalibrationBatchResponse:
+        """Create an immutable calibration batch (采集中): radial runout at the
+        datum stations, bearing heights, pin heights and measured reed tips,
+        referencing a frozen pin-arrangement version. The cylinder axis and
+        eccentricity are fitted and every pin is resolved against the comb.
+        Rejected (404/422) when the source version is missing, the runout grid
+        does not cover the pins, or a reed/pin reference is unknown."""
+        source = _load_cal_source(store, body.source_version_id)
+        try:
+            content_hash, request_dict, result_dict = calibration_freeze.build_batch_payload(
+                source, body.spec
+            )
+        except CalibrationError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        existing = store.get_cal_batch_by_hash(content_hash)
+        if existing is not None:
+            response.status_code = 200
+            return _cal_batch_response(existing, store)
+        row = store.insert_cal_batch(
+            content_hash,
+            freeze.canonical_json(request_dict),
+            json.dumps(result_dict, ensure_ascii=False, sort_keys=True),
+        )
+        return _cal_batch_response(row, store)
+
+    @app.get("/api/calibration/batches", response_model=list[CalibrationBatchSummary])
+    def list_calibration_batches(
+        store: Store = Depends(get_store),
+    ) -> list[CalibrationBatchSummary]:
+        out = []
+        for row in store.list_cal_batches():
+            request = json.loads(row["request_json"])
+            result = json.loads(row["result_json"])
+            out.append(
+                CalibrationBatchSummary(
+                    id=row["id"],
+                    content_hash=row["content_hash"],
+                    created_at=row["created_at"],
+                    status=(
+                        "confirmed"
+                        if store.get_cal_plan_for_batch(row["content_hash"]) is not None
+                        else "collecting"
+                    ),
+                    source_version_id=request["source_version_id"],
+                    pin_count=result["summary"]["pin_count"],
+                    violation_count=result["summary"]["violation_count"],
+                )
+            )
+        return out
+
+    @app.get("/api/calibration/batches/{batch_id}", response_model=CalibrationBatchResponse)
+    def get_calibration_batch(
+        batch_id: int, store: Store = Depends(get_store)
+    ) -> CalibrationBatchResponse:
+        row = store.get_cal_batch(batch_id)
+        if row is None:
+            raise HTTPException(status_code=404, detail="calibration batch not found")
+        return _cal_batch_response(row, store)
+
+    @app.post(
+        "/api/calibration/batches/{batch_id}/search",
+        response_model=CalibrationSearchResponse,
+    )
+    def search_calibration(
+        batch_id: int,
+        body: CalibrationSearchRequest,
+        store: Store = Depends(get_store),
+    ) -> CalibrationSearchResponse:
+        """Search bearing shim stacks x comb lateral shift x comb height
+        adjustment within the maker's locks. Candidates are ranked by
+        violation count, then minimum margin (larger first), adjustment
+        amount and shim variety count."""
+        _row, _request, _result, source, spec = _load_cal_batch(store, batch_id)
+        try:
+            candidates, evaluated = calibration_engine.search(spec, source, body.limits)
+        except CalibrationError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return CalibrationSearchResponse(
+            feasible=any(c.violation_count == 0 for c in candidates),
+            combinations_evaluated=evaluated,
+            candidates=candidates,
+        )
+
+    def _cal_plan_response(row) -> CalibrationPlanResponse:
+        request = json.loads(row["request_json"])
+        result = json.loads(row["result_json"])
+        return CalibrationPlanResponse(
+            id=row["id"],
+            content_hash=row["content_hash"],
+            created_at=row["created_at"],
+            batch_content_hash=request["batch_content_hash"],
+            source_version_id=request["source"]["version_id"],
+            source_content_hash=request["source"]["content_hash"],
+            spec=request["spec"],
+            limits=request["limits"],
+            adjustment=result["adjustment"],
+            fit=result["fit"],
+            pins=result["pins"],
+            diagnostics=result["diagnostics"],
+            summary=result["summary"],
+        )
+
+    @app.post(
+        "/api/calibration/batches/{batch_id}/confirm",
+        response_model=CalibrationPlanResponse,
+        status_code=201,
+    )
+    def confirm_calibration_batch(
+        batch_id: int,
+        body: CalibrationConfirmRequest,
+        response: Response,
+        store: Store = Depends(get_store),
+    ) -> CalibrationPlanResponse:
+        """Confirm a chosen adjustment: freezes an immutable calibration plan
+        (source snapshot, measurements, fit parameters, selected adjustment
+        and input hash) and marks the batch 已确认. Idempotent: the same
+        adjustment under the same limits yields the same plan."""
+        row, _request, _result, source, spec = _load_cal_batch(store, batch_id)
+        try:
+            content_hash, request_dict, result_dict = calibration_freeze.build_plan_payload(
+                source, spec, body.limits, body.adjustment
+            )
+        except CalibrationError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        request_dict["batch_content_hash"] = row["content_hash"]
+        existing = store.get_cal_plan_by_hash(content_hash)
+        if existing is not None:
+            response.status_code = 200
+            return _cal_plan_response(existing)
+        plan_row = store.insert_cal_plan(
+            content_hash,
+            row["content_hash"],
+            freeze.canonical_json(request_dict),
+            json.dumps(result_dict, ensure_ascii=False, sort_keys=True),
+        )
+        return _cal_plan_response(plan_row)
+
+    @app.get("/api/calibration/plans", response_model=list[CalibrationPlanSummary])
+    def list_calibration_plans(
+        store: Store = Depends(get_store),
+    ) -> list[CalibrationPlanSummary]:
+        out = []
+        for row in store.list_cal_plans():
+            request = json.loads(row["request_json"])
+            result = json.loads(row["result_json"])
+            out.append(
+                CalibrationPlanSummary(
+                    id=row["id"],
+                    content_hash=row["content_hash"],
+                    created_at=row["created_at"],
+                    batch_content_hash=request["batch_content_hash"],
+                    violation_count=result["summary"]["violation_count"],
+                    min_margin_mm=result["summary"]["min_margin_mm"],
+                )
+            )
+        return out
+
+    @app.get("/api/calibration/plans/{plan_id}", response_model=CalibrationPlanResponse)
+    def get_calibration_plan(
+        plan_id: int, store: Store = Depends(get_store)
+    ) -> CalibrationPlanResponse:
+        row = store.get_cal_plan(plan_id)
+        if row is None:
+            raise HTTPException(status_code=404, detail="calibration plan not found")
+        return _cal_plan_response(row)
+
+    @app.post(
+        "/api/calibration/plans/{plan_id}/recompute",
+        response_model=CalibrationRecomputeResponse,
+    )
+    def recompute_calibration_plan(
+        plan_id: int, store: Store = Depends(get_store)
+    ) -> CalibrationRecomputeResponse:
+        """Recompute a frozen plan from its stored source snapshot and
+        measurements; the result must be bit-identical (same content hash)."""
+        row = store.get_cal_plan(plan_id)
+        if row is None:
+            raise HTTPException(status_code=404, detail="calibration plan not found")
+        request_dict = json.loads(row["request_json"])
+        stored_result = json.loads(row["result_json"])
+        new_hash, new_result = calibration_freeze.recompute_plan(request_dict)
+        match = new_hash == row["content_hash"] and new_result == stored_result
+        return CalibrationRecomputeResponse(
             id=row["id"],
             match=match,
             stored_hash=row["content_hash"],
